@@ -94,22 +94,4 @@ export default async function (pi: ExtensionAPI) {
     models,
     streamSimple: (await import("./provider.js")).streamCodebuddy,
   });
-
-  pi.registerCommand("codebuddy-refresh-models", {
-    description: "Refresh CodeBuddy model list from SDK",
-    handler: async (_args, ctx) => {
-      const refreshed = await discoverModels();
-      pi.registerProvider("codebuddy", {
-        name: "CodeBuddy",
-        baseUrl: "https://codebuddy.ai",
-        apiKey: "codebuddy-local",
-        api: "codebuddy-sdk",
-        models: refreshed,
-        streamSimple: (await import("./provider.js")).streamCodebuddy,
-      });
-      if (ctx.hasUI) {
-        ctx.ui.notify(`CodeBuddy: ${refreshed.length} models loaded`, "info");
-      }
-    },
-  });
 }
