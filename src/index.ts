@@ -10,7 +10,7 @@
  * Two files: index.ts (registration + model discovery), provider.ts (streaming).
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { ProviderApi, SimpleStreamOptions } from "@earendil-works/pi-ai/compat";
+import type { ProviderApi } from "@earendil-works/pi-ai/compat";
 import { streamCodebuddy } from "./provider.js";
 
 // ── provider registration ──
@@ -25,7 +25,6 @@ export default function activate(api: ExtensionAPI) {
     streamSimple: streamCodebuddy,
   });
 
-  // Lazy model discovery at startup
   queueMicrotask(async () => {
     try {
       const models = await discoverModels();
@@ -38,8 +37,7 @@ export default function activate(api: ExtensionAPI) {
         streamSimple: streamCodebuddy,
       });
     } catch {
-      // Model discovery failed — provider registered with empty models,
-      // user can still try manually.
+      // Model discovery failed — provider stays with empty models, user can try manually.
     }
   });
 }
@@ -52,13 +50,13 @@ async function getSdk() {
   return _sdk;
 }
 
-export async function discoverModels(): Promise<ProviderApi["models"]> {
+async function discoverModels(): Promise<ProviderApi["models"]> {
   const sdk = await getSdk();
   const q = sdk.query({ prompt: " ", options: { maxTurns: 0 } });
   const supported = await q.supportedModels();
   await q.interrupt();
 
-  const models = supported.map((m) => {
+  return supported.map((m) => {
     const caps = detectCapabilities(m.id);
     return {
       id: m.id,
@@ -72,11 +70,9 @@ export async function discoverModels(): Promise<ProviderApi["models"]> {
       maxTokens: caps.maxTokens,
     };
   });
-
-  return models;
 }
 
-// ── capability detection (pattern-based, like pi-claude-bridge) ──
+// ── capability detection ──
 
 const THINKING_PATTERNS = [/claude/i, /gemini/i, /gpt-5/i];
 const IMAGE_PATTERNS = [/claude/i, /gemini/i, /gpt/i];

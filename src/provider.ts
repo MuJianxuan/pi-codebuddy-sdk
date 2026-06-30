@@ -2,7 +2,7 @@
  * Provider entry point — pi-claude-bridge pattern.
  *
  * For each Pi turn:
- * 1. Extract the latest user message (strip context-mode injection)
+ * 1. Extract the latest user message
  * 2. Call sdk.query() — stateless, CodeBuddy uses its own system prompt
  * 3. Stream events back to Pi (text, thinking, toolcalls)
  */
@@ -54,12 +54,6 @@ function makeErrorPartial(model: Model<any>, error: unknown): AssistantMessage {
 
 // ── extract user message ──
 
-/**
- * Extract the latest user message from Pi Context.
- * Strips context-mode session state injection.
- *
- * Like pi-claude-bridge's extractUserPrompt() but with context-mode defense.
- */
 function extractUserMessage(context: Context): string {
   const msgs = context.messages;
   for (let i = msgs.length - 1; i >= 0; i--) {
@@ -162,7 +156,7 @@ export function streamCodebuddy(
         if (options.signal.aborted) { await onAbort(); return; }
       }
 
-      // ── per-block tracking (for stream_event delta accumulation) ──
+      // ── per-block tracking ──
       type BlockKind = "text" | "thinking" | "tool_use" | "redacted_thinking";
       const blockKind = new Map<number, BlockKind>();
       const blockAccum = new Map<number, string>();
@@ -238,7 +232,6 @@ export function streamCodebuddy(
           continue;
         }
 
-        // Token-level streaming via stream_event (preferred)
         if (msg.type === "stream_event") {
           hasStreamEvents = true;
           const evt = msg.event;
@@ -260,7 +253,7 @@ export function streamCodebuddy(
           continue;
         }
 
-        // Fallback: full assistant messages
+        // Fallback: full assistant messages (when model doesn't support streaming)
         if (msg.type === "assistant" && !hasStreamEvents) {
           let ci = 0;
           for (const block of msg.message.content) {
