@@ -1,104 +1,130 @@
 # pi-codebuddy-sdk
 
-Forked from [pi-claude-bridge](https://github.com/elidickinson/pi-claude-bridge). Replaces Claude Agent SDK with CodeBuddy Agent SDK.
+Pi extension that registers **CodeBuddy** as a model provider. You keep using Pi for the TUI, tools, skills, and extensions; CodeBuddy Agent SDK runs inference locally via the `codebuddy` CLI. No HTTP proxy and no changes to how you work in Pi beyond picking a model.
 
-回退到 `@tencent-ai/agent-sdk` 的 Pi provider 扩展。无反向代理，直接使用本地 CodeBuddy CLI，合规安全。
+## What it does
 
-## 安装
+- Exposes CodeBuddy models in Pi (`codebuddy/...` in `/model`)
+- Bridges Pi tools to the SDK (Pi still executes tools; CodeBuddy only plans and calls them)
+- Forwards Pi's system prompt, skills, and project `AGENTS.md` so the model acts as Pi—not as standalone CodeBuddy Code
+- Supports session resume, compaction, streaming, thinking levels, and images
+- Optional **AskCodebuddy** tool to delegate a focused sub-task to another CodeBuddy call
 
-### 方式 1：全局安装（日常使用）
+## Install
 
 ```bash
-ln -s ~/Desktop/usaslahser/pi-codebuddy-sdk/src ~/.pi/agent/extensions/pi-codebuddy-sdk
-cd ~/Desktop/usaslahser/pi-codebuddy-sdk && npm install
+pi install npm:pi-codebuddy-sdk
 ```
 
-重启 Pi 即可自动发现。
+Restart `pi` if it was already running.
 
-### 方式 2：临时加载（测试）
+## Requirements
+
+- **`codebuddy` on your `PATH`** — the extension spawns the same CLI you use standalone. If `which codebuddy` fails, either add it to `PATH` or set `pathToCodebuddyCode` in `codebuddy-sdk.json` (see [Configuration](#configuration)).
+- **CodeBuddy auth already working** — if `codebuddy` works in your terminal, you do not need extra setup for this extension.
+
+## Quick start (already using CodeBuddy)
+
+No `codebuddy-sdk.json` and no plugin-specific env vars are required.
+
+1. `pi install npm:pi-codebuddy-sdk`
+2. Restart `pi`
+3. `/model` → pick `codebuddy/...`
+
+Optional: set `defaultProvider` / `defaultModel` in `~/.pi/agent/settings.json` so you skip `/model` each time.
+
+The first query after startup may take a few seconds while models are discovered from the SDK.
+
+## Auth
+
+The extension does not store credentials. The CodeBuddy CLI reads them from your machine. Use **one** of the following:
+
+### 1. CLI login (recommended)
 
 ```bash
-pi -e ~/Desktop/usaslahser/pi-codebuddy-sdk/src/index.ts --provider codebuddy --model <model>
-```
-
-## 认证
-
-CodeBuddy SDK 从本地环境读取凭证，优先级：
-
-### 1. 已通过 CLI 登录（自动，无需配置）
-
-```bash
-# 如果已登录 CodeBuddy CLI，SDK 自动复用凭证
 codebuddy login
 ```
 
-### 2. API Key（手动设置）
+Complete login in the browser. Credentials stay on your machine; Pi reuses them automatically.
+
+### 2. API key
 
 ```bash
-# 国际版
-export CODEBUDDY_API_KEY="your-key"
+export CODEBUDDY_API_KEY="your-api-key"
+```
 
-# 中国版
-export CODEBUDDY_API_KEY="your-key"
-export CODEBUDDY_INTERNET_ENVIRONMENT=internal
+Obtain the key from your CodeBuddy account. Do not commit it or store it in repo files.
 
-# iOA 版（企业内）
-export CODEBUDDY_API_KEY="your-key"
+### 3. Tencent iOA (internal network)
+
+```bash
 export CODEBUDDY_INTERNET_ENVIRONMENT=ioa
+codebuddy login
 ```
 
-**获取 API Key：**
+Use this when CodeBuddy must run on the iOA network. Add `CODEBUDDY_API_KEY` as well if your environment requires it.
 
-| 版本 | 地址 |
-|------|------|
-| 国际版 | https://www.codebuddy.ai/profile/keys |
-| 中国版 | https://copilot.tencent.com/profile/ |
-| iOA | https://tencent.sso.copilot.tencent.com/profile/keys |
+## Usage
 
-## 使用
+```text
+pi
+/model
+```
+
+Pick any entry prefixed with `codebuddy/` (for example `codebuddy/hy3-preview-agent-ioa`).
+
+Tools, skills, extensions, `/compact`, and steer behave the same as with other Pi providers.
+
+## Configuration
+
+**Optional.** Defaults work for most users.
+
+File: `~/.pi/agent/codebuddy-sdk.json` or `.pi/codebuddy-sdk.json` in a project.
+
+```json
+{
+  "askCodebuddy": {
+    "enabled": true,
+    "allowFullMode": true
+  },
+  "provider": {
+    "appendSystemPrompt": true,
+    "strictMcpConfig": true,
+    "pathToCodebuddyCode": "/path/to/codebuddy"
+  }
+}
+```
+
+| Option | Default | Meaning |
+|--------|---------|---------|
+| `askCodebuddy.enabled` | `true` | Register the AskCodebuddy delegation tool |
+| `askCodebuddy.allowFullMode` | `true` | Allow write-capable delegation mode |
+| `provider.appendSystemPrompt` | `true` | Use Pi's system prompt instead of CodeBuddy's default identity |
+| `provider.strictMcpConfig` | `true` | Use only Pi-bridged MCP tools |
+| `provider.pathToCodebuddyCode` | auto | Path to `codebuddy` when it is **not** on `PATH` |
+
+## Privacy
+
+- The extension does **not** send conversation data to this repository or any third-party telemetry endpoint.
+- Credentials are handled entirely by the CodeBuddy CLI on your machine.
+- Optional debug mode (`CODEBUDDY_SDK_DEBUG=1`) writes **local** logs under `~/.pi/agent/`; paths are redacted, prompts and tool payloads are not logged. Delete logs when finished.
+
+## Troubleshooting
 
 ```bash
-# 列出 codebuddy 所有模型
-pi --list-models
-
-# 使用指定模型
-pi --provider codebuddy --model claude-sonnet-4.6
-
-# 或进入 Pi 后切换
-/model codebuddy/claude-sonnet-4.6
+export CODEBUDDY_SDK_DEBUG=1
 ```
 
-### 推荐模型
+Default log: `~/.pi/agent/codebuddy-sdk.log`. See [CONTRIBUTING.md](CONTRIBUTING.md) for maintainer details.
 
-| 模型 | 说明 |
-|------|------|
-| `claude-sonnet-4.6` | Claude Sonnet 4.6，支持 thinking |
-| `hy3-preview-agent-ioa` | 混元 3 Preview，iOA 内免费无限额度 |
-| `deepseek-v4-pro-ioa` | DeepSeek V4 Pro |
-| `glm-5.2-ioa` | GLM 5.2 |
+## Development
 
-## 特性
+Maintainers: [CONTRIBUTING.md](CONTRIBUTING.md).
 
-| 特性 | 说明 |
-|------|------|
-| **动态模型发现** | 启动时从 CodeBuddy SDK 拉取模型，自动标注 thinking/image 能力 |
-| **Thinking 控制** | Pi 的 thinking level 映射到 CodeBuddy 的 thinking/effort 参数 |
-| **Image 输入** | 原生支持 Claude/Gemini/GPT 的多模态图片输入 |
-| **Abort 处理** | Esc 取消 → CodeBuddy `interrupt()`，干净终止 |
-| **Token 统计** | 包含 cache_read / cache_write / total_cost_usd |
-| **YOLO 模式** | `bypassPermissions`，所有工具自动批准（与 pi-cursor-sdk 一致） |
-| **Stateless** | 每次调用独立 query()，无 session 复用，简单可靠 |
+## License
 
-## FAQ
+MIT
 
-**Q: 和 pi-claude-bridge 有什么区别？**
+## Inspiration
 
-pi-claude-bridge 使用 Anthropic Claude Agent SDK + MCP bridge，需要 session 管理和复杂的工具桥接。pi-codebuddy-sdk 使用腾讯 CodeBuddy Agent SDK，原生工具执行，代码量减少 60%+。
-
-**Q: maxTurns 限制？**
-
-100（安全上限）。CodeBuddy agent 完成任务会自动停止，不会循环满。
-
-**Q: 支持哪些 CodeBuddy 版本？**
-
-CodeBuddy CLI >= 2.x（`@tencent-ai/agent-sdk` >= 0.3.0）。
+Early MCP bridge patterns were inspired by [pi-claude-bridge](https://github.com/elidickinson/pi-claude-bridge). This package is a separate codebase on [@tencent-ai/agent-sdk](https://www.npmjs.com/package/@tencent-ai/agent-sdk).

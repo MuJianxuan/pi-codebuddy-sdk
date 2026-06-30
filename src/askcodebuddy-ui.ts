@@ -1,6 +1,6 @@
-// Status-line rendering helpers for the AskClaude tool.
+// Status-line rendering helpers for the AskCodebuddy tool.
 //
-// While Claude Code runs inside an AskClaude call, the pi TUI can't surface
+// While CodeBuddy runs inside an AskCodebuddy call, the pi TUI can't surface
 // each tool_use individually — there's only one status row for the whole
 // delegation. These helpers shape a tool_use record into a short, path-aware
 // label (e.g. "Read(src/foo.ts)", "Bash(git log --oneline…)") and collapse
@@ -65,7 +65,7 @@ export function formatToolAction(tc: ToolCallState): string | undefined {
 		const label = current ? String(current.content ?? "").slice(0, 40) : "";
 		return label || undefined;
 	} else if (verb === "askclaude") {
-		// Recursive — don't show AskClaude in its own action summary
+		// Recursive — don't show AskCodebuddy in its own action summary
 		return undefined;
 	}
 	return tc.name;
