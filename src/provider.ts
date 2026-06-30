@@ -62,29 +62,12 @@ function makeErrorPartial(model: Model<any>, error: unknown): AssistantMessage {
  */
 function extractUserMessage(context: Context): string {
   const msgs = context.messages;
-
-  // Pi injects context-mode state as the LAST user message (after the real one).
-  // Search from the end, skip obvious context-mode injections.
   for (let i = msgs.length - 1; i >= 0; i--) {
     if (msgs[i].role !== "user") continue;
     const raw = contentToText((msgs[i] as any).content);
-    if (!raw) continue;
-
-    // Skip messages that are entirely context-mode injection
-    if (isContextModeInjection(raw)) continue;
-
-    return stripPiInjection(raw);
+    if (raw) return raw.trim();
   }
   return "Continue.";
-}
-
-/** Detect if a user message is a Pi context-mode state injection (not a real message). */
-function isContextModeInjection(text: string): boolean {
-  const t = text.trim();
-  if (t.startsWith("context-mode active.")) return true;
-  if (t.includes("<session_state") || t.includes("<session_mode")) return true;
-  if (t.startsWith("<summary>") && t.includes("</summary>")) return true;
-  return false;
 }
 
 function contentToText(content: unknown): string {
@@ -94,55 +77,6 @@ function contentToText(content: unknown): string {
     .filter((c: any) => c?.type === "text")
     .map((c: any) => c.text as string)
     .join("\n");
-}
-
-/**
- * Strip context-mode session state that Pi prepends to user messages.
- *
- * Pi injects several formats:
- *   context-mode active. Hierarchy: ...
- *   <session_state source="compaction"> ... </session_state>
- *   <summary>Compacted: ...</summary>
- *
- * Strip all of them, keep only the actual user message.
- */
-function stripPiInjection(text: string): string {
-  // Fast path
-  if (!text.includes("context-mode") && !text.includes("<session_state") && !text.includes("<summary>")) {
-    return text;
-  }
-
-  // 1. Remove <summary> blocks (compaction summaries contain context-mode state)
-  text = text.replace(/<summary>[\s\S]*?<\/summary>\s*/g, "");
-
-  // 2. Remove <session_state> block and everything between "context-mode" and </session_state>
-  const sessionEnd = text.lastIndexOf("</session_state>");
-  if (sessionEnd >= 0) {
-    const after = text.slice(sessionEnd + "</session_state>".length).trimStart();
-    if (after) {
-      text = after;
-    } else {
-      // All content was in the session_state block
-      const before = text.slice(0, text.indexOf("<session_state")).trim();
-      if (before) text = before;
-    }
-  }
-
-  // 3. Remove "context-mode active." line and everything after until a blank line
-  //    Pattern: "context-mode active. ... Hierarchy: ..." followed by blank line, then real message
-  const cmRe = /context-mode active\.[\s\S]*?\n\s*\n([\s\S]*)$/;
-  const cmMatch = text.match(cmRe);
-  if (cmMatch?.[1]?.trim()) {
-    text = cmMatch[1].trim();
-  }
-
-  // 4. If "context-mode" is still the only content, return empty
-  if (text.trim() === "context-mode active." || text.trim().startsWith("context-mode active.")) {
-    const afterCm = text.replace(/context-mode active\.[\s\S]*/, "").trim();
-    if (afterCm) text = afterCm;
-  }
-
-  return text.trim() || text;
 }
 
 // ── thinking config ──
