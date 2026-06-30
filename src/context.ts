@@ -71,23 +71,21 @@ function buildMessage(context: Context, startIndex: number): string | CbUserMess
  * The latest user message is always excluded (handled separately).
  */
 function buildHistoryPrefix(context: Context, startIndex: number): string {
+  // ponytail: on first turn, send only previous user messages as context.
+  // Assistant messages, tool calls, tool results, system injections
+  // (context-mode state, compaction XML, MCP references) are all from
+  // another provider and confuse CodeBuddy models.
+  if (startIndex === 0) {
+    return buildUserOnlyPrefix(context);
+  }
+
+  // Continuation turns: include all new messages (from this CodeBuddy session).
   const parts: string[] = [];
-
-  // ponytail: skip Pi systemPrompt — CodeBuddy uses its own.
-  // Pi's prompt references MCP/tool ecosystem not present in CodeBuddy,
-  // which confuses the model into calling non-existent tools.
-
   const messages = context.messages;
 
-  // All messages in range except the last user message
   for (let i = startIndex; i < messages.length; i++) {
     const msg = messages[i];
     if (i === messages.length - 1 && msg.role === "user") continue;
-
-    // Skip assistant messages on first turn — they're from the previous
-    // provider and contain provider-specific instructions (MCP tools,
-    // context-mode, boot protocol) that confuse CodeBuddy models.
-    if (msg.role === "assistant" && startIndex === 0) continue;
 
     if (msg.role === "user") {
       const text = extractTextContent(msg.content);
@@ -137,6 +135,31 @@ function truncateToolResult(text: string): string {
 }
 
 // ── helpers ──
+
+/**
+ * First-turn prefix: only previous user messages.
+ * Skips assistant, tool results, system injections — all provider noise.
+ */
+function buildUserOnlyPrefix(context: Context): string {
+  const messages = context.messages;
+  if (messages.length <= 1) return "";
+
+  const parts: string[] = [];
+  for (let i = 0; i < messages.length - 1; i++) {
+    const msg = messages[i];
+    if (msg.role === "user") {
+      const text = extractTextContent(msg.content);
+      const hasImages = extractImages(msg).length > 0;
+      if (text) {
+        parts.push(`User: ${text}${hasImages ? " [image omitted]" : ""}`);
+      } else if (hasImages) {
+        parts.push("User: [image omitted]");
+      }
+    }
+    // skip everything else: assistant, toolResult, system injections
+  }
+  return parts.length > 0 ? parts.join("\n") + "\n\n" : "";
+}
 
 function findLastUserMessage(context: Context, startIndex: number) {
   for (let i = context.messages.length - 1; i >= startIndex; i--) {
