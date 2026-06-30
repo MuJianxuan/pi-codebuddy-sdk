@@ -1,5 +1,7 @@
 # pi-codebuddy-sdk
 
+Forked from [pi-claude-bridge](https://github.com/elidickinson/pi-claude-bridge). Replaces Claude Agent SDK with CodeBuddy Agent SDK.
+
 回退到 `@tencent-ai/agent-sdk` 的 Pi provider 扩展。无反向代理，直接使用本地 CodeBuddy CLI，合规安全。
 
 ## 安装
@@ -7,8 +9,8 @@
 ### 方式 1：全局安装（日常使用）
 
 ```bash
-ln -s ~/Desktop/pi-codebuddy/src ~/.pi/agent/extensions/pi-codebuddy
-cd ~/Desktop/pi-codebuddy && npm install
+ln -s ~/Desktop/usaslahser/pi-codebuddy-sdk/src ~/.pi/agent/extensions/pi-codebuddy-sdk
+cd ~/Desktop/usaslahser/pi-codebuddy-sdk && npm install
 ```
 
 重启 Pi 即可自动发现。
@@ -16,7 +18,7 @@ cd ~/Desktop/pi-codebuddy && npm install
 ### 方式 2：临时加载（测试）
 
 ```bash
-pi -e ~/Desktop/pi-codebuddy/src/index.ts --provider codebuddy --model <model>
+pi -e ~/Desktop/usaslahser/pi-codebuddy-sdk/src/index.ts --provider codebuddy --model <model>
 ```
 
 ## 认证
@@ -71,32 +73,27 @@ pi --provider codebuddy --model claude-sonnet-4.6
 | 模型 | 说明 |
 |------|------|
 | `claude-sonnet-4.6` | Claude Sonnet 4.6，支持 thinking |
-| `claude-opus-4.8` | Claude Opus 4.8，支持 thinking + image |
-| `gemini-3.1-pro` | Gemini 3.1 Pro，支持 thinking + image |
-| `gpt-5.5` | GPT-5.5，支持 thinking + image |
 | `hy3-preview-agent-ioa` | 混元 3 Preview，iOA 内免费无限额度 |
+| `deepseek-v4-pro-ioa` | DeepSeek V4 Pro |
+| `glm-5.2-ioa` | GLM 5.2 |
 
 ## 特性
 
 | 特性 | 说明 |
 |------|------|
-| **动态模型发现** | 启动时从 CodeBuddy SDK 拉取 29 个模型，自动标注 thinking/image 能力 |
-| **Session 池复用** | 多轮对话复用同一 CodeBuddy CLI 进程，首轮后每轮省 ~6s 启动 |
+| **动态模型发现** | 启动时从 CodeBuddy SDK 拉取模型，自动标注 thinking/image 能力 |
 | **Thinking 控制** | Pi 的 thinking level 映射到 CodeBuddy 的 thinking/effort 参数 |
 | **Image 输入** | 原生支持 Claude/Gemini/GPT 的多模态图片输入 |
 | **Abort 处理** | Esc 取消 → CodeBuddy `interrupt()`，干净终止 |
 | **Token 统计** | 包含 cache_read / cache_write / total_cost_usd |
 | **YOLO 模式** | `bypassPermissions`，所有工具自动批准（与 pi-cursor-sdk 一致） |
+| **Stateless** | 每次调用独立 query()，无 session 复用，简单可靠 |
 
 ## FAQ
 
-**Q: 和 pi-cursor-sdk 有什么区别？**
+**Q: 和 pi-claude-bridge 有什么区别？**
 
-pi-cursor-sdk 需要自建 MCP bridge 桥接 Cursor SDK 工具，pi-codebuddy SDK 原生处理工具执行，代码量减少 60%+。
-
-**Q: 怎么查看当前用了多少 tokens？**
-
-每次回复后 Pi 会显示 usage，包含 input/output/cache/total 及费用。
+pi-claude-bridge 使用 Anthropic Claude Agent SDK + MCP bridge，需要 session 管理和复杂的工具桥接。pi-codebuddy-sdk 使用腾讯 CodeBuddy Agent SDK，原生工具执行，代码量减少 60%+。
 
 **Q: maxTurns 限制？**
 
@@ -104,4 +101,4 @@ pi-cursor-sdk 需要自建 MCP bridge 桥接 Cursor SDK 工具，pi-codebuddy SD
 
 **Q: 支持哪些 CodeBuddy 版本？**
 
-CodeBuddy CLI ≥ 2.x（`@tencent-ai/agent-sdk` ≥ 0.3.0）。
+CodeBuddy CLI >= 2.x（`@tencent-ai/agent-sdk` >= 0.3.0）。
