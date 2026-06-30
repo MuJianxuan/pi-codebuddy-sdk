@@ -84,6 +84,11 @@ function buildHistoryPrefix(context: Context, startIndex: number): string {
     const msg = messages[i];
     if (i === messages.length - 1 && msg.role === "user") continue;
 
+    // Skip assistant messages on first turn — they're from the previous
+    // provider and contain provider-specific instructions (MCP tools,
+    // context-mode, boot protocol) that confuse CodeBuddy models.
+    if (msg.role === "assistant" && startIndex === 0) continue;
+
     if (msg.role === "user") {
       const text = extractTextContent(msg.content);
       const hasImages = extractImages(msg).length > 0;
