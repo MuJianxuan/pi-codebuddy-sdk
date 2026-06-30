@@ -16,31 +16,59 @@ import { streamCodebuddy } from "./provider.js";
 // ── provider registration ──
 
 export default function activate(api: ExtensionAPI) {
+  // Register synchronously with hardcoded models first.
+  // Lazy discovery runs after startup — if it succeeds, re-registers with full list.
   api.registerProvider("codebuddy", {
     name: "CodeBuddy",
     baseUrl: "codebuddy-local",
     apiKey: "codebuddy-local-auth",
     api: "codebuddy-sdk",
-    models: [],
+    models: FALLBACK_MODELS,
     streamSimple: streamCodebuddy,
   });
 
-  queueMicrotask(async () => {
-    try {
-      const models = await discoverModels();
-      api.registerProvider("codebuddy", {
-        name: "CodeBuddy",
-        baseUrl: "codebuddy-local",
-        apiKey: "codebuddy-local-auth",
-        api: "codebuddy-sdk",
-        models,
-        streamSimple: streamCodebuddy,
-      });
-    } catch {
-      // Model discovery failed — provider stays with empty models, user can try manually.
-    }
-  });
+  // Async model discovery — updates provider with live model list
+  discoverAndUpdate(api);
 }
+
+async function discoverAndUpdate(api: ExtensionAPI) {
+  try {
+    const models = await discoverModels();
+    api.registerProvider("codebuddy", {
+      name: "CodeBuddy",
+      baseUrl: "codebuddy-local",
+      apiKey: "codebuddy-local-auth",
+      api: "codebuddy-sdk",
+      models,
+      streamSimple: streamCodebuddy,
+    });
+  } catch {
+    // Fallback models already registered
+  }
+}
+
+// ── hardcoded fallback models (used before async discovery completes) ──
+
+const FALLBACK_MODELS: ProviderApi["models"] = [
+  {
+    id: "hy3-preview-agent-ioa", name: "Hunyuan 3", api: "codebuddy-sdk", provider: "codebuddy",
+    baseUrl: "https://codebuddy.tencent.com", reasoning: false, input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 131072, maxTokens: 8192,
+  },
+  {
+    id: "claude-sonnet-4.6", name: "Claude Sonnet 4.6", api: "codebuddy-sdk", provider: "codebuddy",
+    baseUrl: "https://codebuddy.tencent.com", reasoning: true, input: ["text", "image"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 200000, maxTokens: 8192,
+  },
+  {
+    id: "deepseek-v4-pro-ioa", name: "DeepSeek V4 Pro", api: "codebuddy-sdk", provider: "codebuddy",
+    baseUrl: "https://codebuddy.tencent.com", reasoning: false, input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 131072, maxTokens: 8192,
+  },
+];
 
 // ── model discovery ──
 
