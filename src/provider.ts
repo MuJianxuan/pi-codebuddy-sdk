@@ -1,3 +1,12 @@
+/**
+ * CodeBuddy Provider — stateless, lightweight.
+ *
+ * Uses sdk.query() (one-shot) — no context building, no session pool,
+ * no tool boundary. Pi manages conversation, CodeBuddy is just a model backend.
+ *
+ * Architecture follows pi-openai-compatible / pi-anthropic pattern:
+ * extract latest user message → send to SDK → stream events back to Pi.
+ */
 import {
   createAssistantMessageEventStream,
   type Api,
@@ -16,8 +25,6 @@ import type {
   Effort,
   RawMessageStreamEvent,
 } from "@tencent-ai/agent-sdk";
-import { buildFullMessage, buildDeltaMessage } from "./context.js";
-import { acquireSession, evictSession } from "./session-pool.js";
 
 type CodebuddySdk = typeof import("@tencent-ai/agent-sdk");
 
@@ -70,13 +77,33 @@ function extractUsageUpdate(msg: CbMessage): Partial<AssistantMessage> | null {
   return null;
 }
 
+// ── extract latest user message ──
+
+function extractLatestUserText(context: Context): string {
+  const messages = context.messages;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "user") {
+      const content = (messages[i] as any).content;
+      if (typeof content === "string") return content;
+      if (Array.isArray(content)) {
+        const texts = content
+          .filter((c: any) => c?.type === "text")
+          .map((c: any) => c.text)
+          .join("\n");
+        if (texts) return texts;
+      }
+    }
+  }
+  return "Continue.";
+}
+
 // ── thinking config mapping ──
 
 const DEFAULT_THINKING_BUDGETS: Record<string, number> = {
   minimal: 1600,
   low: 4000,
-  medium: 0,  // adaptive
-  high: 0,    // adaptive
+  medium: 0,
+  high: 0,
   xhigh: 32000,
 };
 
@@ -114,53 +141,35 @@ export function streamCodebuddy(
   const partial = makePartial(model);
 
   queueMicrotask(async () => {
-    let session: Awaited<ReturnType<CodebuddySdk["unstable_v2_createSession"]>> | undefined;
-    let isFirst = false;
-
     try {
       stream.push({ type: "start", partial });
 
       const sdk = await loadCodebuddySdk();
+      const userText = extractLatestUserText(context);
 
       const { thinking, effort } = buildThinkingConfig(
         options?.reasoning,
         options?.thinkingBudgets,
       );
 
-      // Always request partial messages so we get stream_event deltas for real streaming.
-      // Non-streaming-capable models will still emit assistant messages as fallback.
-      const includePartial = true;
-
-      const cwd = process.cwd();
-
-      const { session: pooled, message: userMessage, isFirst: first } =
-        await acquireSession(cwd, sdk, context, buildFullMessage, buildDeltaMessage, {
+      const q = sdk.query({
+        prompt: userText,
+        options: {
           model: model.id,
           permissionMode: "bypassPermissions",
           maxTurns: 100,
           thinking,
           effort,
-          includePartialMessages: includePartial,
-        });
-
-      session = pooled;
-      isFirst = first;
-
-      let msgCount = 0; // track content blocks for empty-response detection
-      let hasStreamEvents = false; // true once we see first stream_event
-
-      // Per-index tracking for stream_event delta accumulation
-      type BlockKind = 'text' | 'thinking' | 'tool_use' | 'redacted_thinking';
-      const blockKind = new Map<number, BlockKind>();
-      const blockAccum = new Map<number, string>();
-      const blockMeta = new Map<number, { id: string; name: string; signature?: string }>();
+          includePartialMessages: true,
+        },
+      });
 
       // ── abort handling ──
       let aborted = false;
       const onAbort = async () => {
         if (aborted) return;
         aborted = true;
-        try { await session!.interrupt(); } catch { /* best-effort */ }
+        try { await q.interrupt(); } catch { /* best-effort */ }
         partial.stopReason = "aborted";
         stream.push({ type: "error", reason: "aborted", error: partial });
       };
@@ -172,10 +181,14 @@ export function streamCodebuddy(
         }
       }
 
-      // ── send prompt ──
-      await session.send(userMessage);
+      // ── per-index block tracking ──
+      type BlockKind = 'text' | 'thinking' | 'tool_use' | 'redacted_thinking';
+      const blockKind = new Map<number, BlockKind>();
+      const blockAccum = new Map<number, string>();
+      const blockMeta = new Map<number, { id: string; name: string; signature?: string }>();
 
-      // ── helpers for stream_event block tracking ──
+      let hasStreamEvents = false;
+
       function onBlockStart(idx: number, kind: BlockKind, initText: string, meta?: { id: string; name: string; signature?: string }) {
         blockKind.set(idx, kind);
         blockAccum.set(idx, initText);
@@ -186,22 +199,18 @@ export function streamCodebuddy(
           partial.content = [...partial.content, tc];
           stream.push({ type: 'thinking_start', contentIndex: idx, partial });
           stream.push({ type: 'thinking_end', contentIndex: idx, content: '[redacted]', partial });
-          msgCount++;
         } else if (kind === 'thinking') {
           const tc: ThinkingContent = { type: 'thinking', thinking: initText, thinkingSignature: meta?.signature };
           partial.content = [...partial.content, tc];
           stream.push({ type: 'thinking_start', contentIndex: idx, partial });
-          msgCount++;
         } else if (kind === 'text') {
           const tb: TextContent = { type: 'text', text: initText };
           partial.content = [...partial.content, tb];
           stream.push({ type: 'text_start', contentIndex: idx, partial });
-          msgCount++;
         } else if (kind === 'tool_use' && meta) {
           const toolCall: ToolCall = { type: 'toolCall', id: meta.id, name: meta.name, arguments: {} };
           partial.content = [...partial.content, toolCall];
           stream.push({ type: 'toolcall_start', contentIndex: idx, partial });
-          msgCount++;
         }
       }
 
@@ -229,7 +238,7 @@ export function streamCodebuddy(
           const blocks = [...partial.content];
           try {
             blocks[idx] = { ...blocks[idx], arguments: JSON.parse(newJson) };
-          } catch { /* partial JSON — keep previous */ }
+          } catch { /* partial JSON */ }
           partial.content = blocks;
           stream.push({ type: 'toolcall_delta', contentIndex: idx, delta: deltaValue, partial } as any);
         }
@@ -248,8 +257,8 @@ export function streamCodebuddy(
         }
       }
 
-      // ── iterate responses ──
-      for await (const msg of session.stream()) {
+      // ── iterate ──
+      for await (const msg of q) {
         if (aborted) return;
 
         if (msg.type === "system") {
@@ -257,7 +266,6 @@ export function streamCodebuddy(
           continue;
         }
 
-        // Primary path: token-level streaming via stream_event
         if (msg.type === "stream_event") {
           hasStreamEvents = true;
           const evt = msg.event;
@@ -279,21 +287,19 @@ export function streamCodebuddy(
             if (d.type === 'text_delta') onBlockDelta(evt.index, 'text_delta', d.text);
             else if (d.type === 'thinking_delta') onBlockDelta(evt.index, 'thinking_delta', d.thinking);
             else if (d.type === 'input_json_delta') onBlockDelta(evt.index, 'input_json_delta', d.partial_json);
-            // ponytail: signature_delta not surfaced to Pi — signature only sent at block start
           } else if (evt.type === "content_block_stop") {
             onBlockStop(evt.index);
           }
           continue;
         }
 
-        // Fallback: full assistant messages (used when model doesn't support streaming)
+        // Fallback: full assistant messages
         if (msg.type === "assistant" && !hasStreamEvents) {
-          msgCount++;
           let ci = 0;
           for (const block of msg.message.content) {
             const idx = ci++;
             if (block.type === "thinking") {
-              onBlockStart(idx, 'thinking', block.thinking, { id: '', name: '', signature: undefined });
+              onBlockStart(idx, 'thinking', block.thinking);
               onBlockStop(idx);
             } else if (block.type === "redacted_thinking") {
               onBlockStart(idx, 'redacted_thinking', '[redacted]', { id: '', name: '', signature: block.data });
@@ -319,24 +325,13 @@ export function streamCodebuddy(
             partial.stopReason = "error";
             partial.errorMessage = msg.errors?.join("; ") ?? `CodeBuddy error: ${msg.subtype}`;
             stream.push({ type: "error", reason: "error", error: { ...partial } });
-            evictSession(cwd);
           }
           break;
         }
       }
-
-      // Some models (Hunyuan) return empty on session reuse → evict for fresh session next turn
-      if (msgCount === 0) {
-        evictSession(cwd);
-      }
     } catch (error) {
-      evictSession(process.cwd());
       const errPartial = makeErrorPartial(model, error);
       stream.push({ type: "error", reason: "error", error: errPartial });
-    } finally {
-      // ponytail: do NOT close pooled sessions — they are reused across turns.
-      // Only close when evicted (via evictSession).
-      // session?.close() intentionally omitted here.
     }
   });
 
