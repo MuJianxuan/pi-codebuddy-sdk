@@ -1,13 +1,20 @@
 {
-  "name": "pi-codebuddy-sdk",
+  "name": "@raoxxxwq/pi-codebuddy-sdk",
   "version": "0.3.0",
   "description": "Pi extension that uses CodeBuddy (via Agent SDK) as a model provider and adds an AskCodebuddy tool.",
-  "author": "slahser",
+  "author": "raoxxxwq",
   "license": "MIT",
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/RealAlexandreAI/pi-codebuddy-sdk.git"
+    "url": "git+https://github.com/MuJianxuan/pi-codebuddy-sdk.git"
+  },
+  "bugs": {
+    "url": "https://github.com/MuJianxuan/pi-codebuddy-sdk/issues"
+  },
+  "homepage": "https://github.com/MuJianxuan/pi-codebuddy-sdk#readme",
+  "publishConfig": {
+    "access": "public"
   },
   "engines": {
     "node": ">=20"

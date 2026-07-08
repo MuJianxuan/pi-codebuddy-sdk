@@ -10,7 +10,7 @@ Guide for maintainers. End users only need [README.md](README.md).
 - **CodeBuddy auth** — same three options as README: `codebuddy login`, `CODEBUDDY_API_KEY`, or iOA (`CODEBUDDY_INTERNET_ENVIRONMENT=ioa`)
 
 ```bash
-git clone <repo>
+git clone git@github.com:MuJianxuan/pi-codebuddy-sdk.git
 cd pi-codebuddy-sdk
 npm install
 npm run typecheck
@@ -132,7 +132,7 @@ Artifacts go to **`.test-output/`** (gitignored). Never commit that directory.
 
 ```bash
 pi install /absolute/path/to/pi-codebuddy-sdk
-# or after publish: pi install npm:pi-codebuddy-sdk
+# or after publish: pi install npm:@raoxxxwq/pi-codebuddy-sdk
 ```
 
 Then in Pi: `/model` → pick `codebuddy/...`.

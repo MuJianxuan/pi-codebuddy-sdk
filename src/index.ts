@@ -44,7 +44,7 @@ type CliDebugOptions = { debug?: boolean; debugFile?: string };
 const DEBUG = process.env.CODEBUDDY_SDK_DEBUG === "1";
 const DEBUG_LOG_PATH = process.env.CODEBUDDY_SDK_DEBUG_PATH || join(homedir(), ".pi", "agent", "codebuddy-sdk.log");
 const DIAG_LOG_PATH = join(homedir(), ".pi", "agent", "codebuddy-sdk-diag.log");
-const ISSUES_URL = "https://github.com/RealAlexandreAI/pi-codebuddy-sdk/issues/new";
+const ISSUES_URL = "https://github.com/MuJianxuan/pi-codebuddy-sdk/issues/new";
 
 function redactForLog(value: string): string {
 	const home = homedir();

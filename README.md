@@ -1,6 +1,9 @@
-# pi-codebuddy-sdk
+# @raoxxxwq/pi-codebuddy-sdk
 
 Pi extension that registers **CodeBuddy** as a model provider. You keep using Pi for the TUI, tools, skills, and extensions; CodeBuddy Agent SDK runs inference locally via the `codebuddy` CLI. No HTTP proxy and no changes to how you work in Pi beyond picking a model.
+
+- Repository: `https://github.com/MuJianxuan/pi-codebuddy-sdk`
+- Author: `raoxxxwq`
 
 ## What it does
 
@@ -14,7 +17,7 @@ Pi extension that registers **CodeBuddy** as a model provider. You keep using Pi
 ## Install
 
 ```bash
-pi install npm:pi-codebuddy-sdk
+pi install npm:@raoxxxwq/pi-codebuddy-sdk
 ```
 
 Restart `pi` if it was already running.
@@ -28,7 +31,7 @@ Restart `pi` if it was already running.
 
 No `codebuddy-sdk.json` and no plugin-specific env vars are required.
 
-1. `pi install npm:pi-codebuddy-sdk`
+1. `pi install npm:@raoxxxwq/pi-codebuddy-sdk`
 2. Restart `pi`
 3. `/model` → pick `codebuddy/...`
 
