@@ -100,8 +100,8 @@ File: `~/.pi/agent/codebuddy-sdk.json` or `.pi/codebuddy-sdk.json` in a project.
 |--------|---------|---------|
 | `askCodebuddy.enabled` | `true` | Register the AskCodebuddy delegation tool |
 | `askCodebuddy.allowFullMode` | `true` | Allow write-capable delegation mode |
-| `provider.appendSystemPrompt` | `true` | Use Pi's system prompt instead of CodeBuddy's default identity |
-| `provider.strictMcpConfig` | `true` | Use only Pi-bridged MCP tools |
+| `provider.appendSystemPrompt` | `true` | Use Pi's system prompt and Pi Tool Bridge guidance instead of CodeBuddy's default identity; disable only for debugging/compatibility |
+| `provider.strictMcpConfig` | `true` | Use only Pi-bridged MCP tools so Pi remains the tool execution boundary; disable only for debugging/compatibility |
 | `provider.pathToCodebuddyCode` | auto | Path to `codebuddy` when it is **not** on `PATH` |
 
 ## Privacy

@@ -10,7 +10,7 @@ import { homedir } from "os";
 import { dirname, join } from "path";
 import { PROVIDER_ID, messageContentToText, convertPiMessages } from "./convert.js";
 import { buildModels, codebuddyModelId, FALLBACK_MODELS, rawModelsFromSdk, resolveModel as _resolveModel, type PiModel } from "./models.js";
-import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, buildCodebuddySystemPrompt } from "./skills.js";
+import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, buildCodebuddySystemPrompt, enhancePiToolForCodebuddy } from "./skills.js";
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
 import { QueryContext, ctx } from "./query-state.js";
@@ -34,6 +34,9 @@ const newAssistantMessageEventStream: () => AssistantMessageEventStream =
 	typeof _piAi.createAssistantMessageEventStream === "function"
 		? _piAi.createAssistantMessageEventStream
 		: () => new _piAi.AssistantMessageEventStream();
+
+type SdkQueryOptions = NonNullable<Parameters<typeof query>[0]["options"]>;
+type CliDebugOptions = { debug?: boolean; debugFile?: string };
 
 // --- Debug logging ---
 // CODEBUDDY_SDK_DEBUG=1 enables local debug logs (metadata only; paths redacted; no prompt/tool bodies).
@@ -657,8 +660,86 @@ export const __test = {
 	getSharedSession() {
 		return sharedSession;
 	},
+	createDelegationSessionFromContext,
+	buildProviderBoundaryOptions,
+	buildProviderQueryOptions,
 	syncSharedSession,
 };
+
+function createDelegationSessionFromContext(
+	messages: Context["messages"] | undefined,
+	cwd: string,
+	modelId?: string,
+): string | null {
+	if (!messages?.length) return null;
+	const delegationMessages = stripToolHistoryForDelegation(messages);
+	if (!delegationMessages.length) return null;
+	const session = createSession({
+		projectPath: cwd,
+		codebuddyDir: process.env.CODEBUDDY_CONFIG_DIR,
+		...(modelId ? { model: modelId } : {}),
+	});
+	convertAndImportMessages(session, delegationMessages);
+	session.save();
+	verifyWrittenSession(session.jsonlPath, session.sessionId, session.messages.length, cwd);
+	debug(`askCodebuddy: created delegation session ${session.sessionId.slice(0, 8)} records=${session.messages.length}`);
+	return session.sessionId;
+}
+
+function stripToolHistoryForDelegation(messages: Context["messages"]): Context["messages"] {
+	return messages.flatMap((message) => {
+		if (message.role === "toolResult") return [];
+		if (message.role !== "assistant" || !Array.isArray(message.content)) return [message];
+		const content = message.content.filter((block) => block.type !== "toolCall");
+		return content.length ? [{ ...message, content }] : [];
+	}) as Context["messages"];
+}
+
+function buildProviderBoundaryOptions(settings: NonNullable<Config["provider"]>) {
+	const appendSystemPrompt = settings.appendSystemPrompt !== false;
+	const strictMcpConfigEnabled = settings.strictMcpConfig !== false;
+	const extraArgs: Record<string, string | null> = {};
+	if (strictMcpConfigEnabled) extraArgs["strict-mcp-config"] = null;
+	return {
+		appendSystemPrompt,
+		strictMcpConfigEnabled,
+		tools: [] as string[],
+		extraArgs,
+		settingSources: appendSystemPrompt
+			? undefined
+			: settings.settingSources ?? ["user", "project"] as SettingSource[],
+	};
+}
+
+function buildProviderQueryOptions(input: {
+	providerSettings: NonNullable<Config["provider"]>;
+	cliModel: string;
+	cwd: string;
+	env: NodeJS.ProcessEnv;
+	systemPrompt?: string;
+	effort?: Effort;
+	mcpServers?: SdkQueryOptions["mcpServers"];
+	resumeSessionId?: string | null;
+	codebuddyExecutable?: string;
+	debugOptions?: CliDebugOptions;
+}): SdkQueryOptions {
+	const boundaryOptions = buildProviderBoundaryOptions(input.providerSettings);
+	return {
+		cwd: input.cwd,
+		env: input.env,
+		tools: boundaryOptions.tools,
+		permissionMode: "bypassPermissions",
+		includePartialMessages: true,
+		systemPrompt: input.systemPrompt,
+		extraArgs: { ...boundaryOptions.extraArgs, model: input.cliModel },
+		...(input.effort ? { effort: input.effort } : {}),
+		...(boundaryOptions.settingSources ? { settingSources: boundaryOptions.settingSources } : {}),
+		...(input.mcpServers ? { mcpServers: input.mcpServers } : {}),
+		...(input.resumeSessionId ? { resume: input.resumeSessionId } : {}),
+		...(input.codebuddyExecutable ? { pathToCodebuddyCode: input.codebuddyExecutable } : {}),
+		...(input.debugOptions ?? {}),
+	};
+}
 
 // --- Provider helpers: tool name mapping ---
 
@@ -740,7 +821,7 @@ function resolveMcpTools(context: Context, excludeToolName?: string): {
 	for (const tool of context.tools) {
 		if (tool.name === excludeToolName) continue;
 		const sdkName = `${MCP_TOOL_PREFIX}${tool.name}`;
-		mcpTools.push(tool);
+		mcpTools.push(enhancePiToolForCodebuddy(tool));
 		customToolNameToSdk.set(tool.name, sdkName);
 		customToolNameToSdk.set(tool.name.toLowerCase(), sdkName);
 		customToolNameToPi.set(sdkName, tool.name);
@@ -1287,20 +1368,17 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 		? wrapPromptStream(promptBlocks)
 		: promptText;
 	const mcpServers = buildMcpServers(mcpTools, queryCtx);
-	const appendSystemPrompt = providerSettings.appendSystemPrompt !== false;
+	const boundaryOptions = buildProviderBoundaryOptions(providerSettings);
+	const appendSystemPrompt = boundaryOptions.appendSystemPrompt;
 	const systemPrompt = appendSystemPrompt
-		? buildCodebuddySystemPrompt(context.systemPrompt)
+		? buildCodebuddySystemPrompt(context.systemPrompt, { availableToolNames: mcpTools.map((tool) => tool.name) })
 		: undefined;
 
-	// MCP auto-loading suppression: CC reads MCP servers from ~/.claude.json (top-level
-	// + per-project) and .mcp.json. Since pi executes tools (not CC), those are pure
-	// token overhead. --strict-mcp-config tells the binary to use ONLY mcpServers passed
-	// programmatically and ignore filesystem MCP entries — applied unconditionally because
-	// settingSources=undefined does NOT give isolation (the CC default loads all sources).
-	const settingSources: SettingSource[] | undefined = appendSystemPrompt
-		? undefined
-		: providerSettings.settingSources ?? ["user", "project"];
-	const strictMcpConfigEnabled = providerSettings.strictMcpConfig !== false;
+	// Provider Path keeps CodeBuddy inside Pi's tool boundary: no built-in SDK
+	// tools, strict MCP by default, and no filesystem settings while Pi's system
+	// prompt override is active. Current SDK maps settingSources=undefined to
+	// `--setting-sources none`; appendSystemPrompt=false is the compatibility
+	// escape hatch that re-enables user/project settings by default.
 	const codebuddyExecutable = providerSettings.pathToCodebuddyCode;
 
 	// Prefer the model's own thinkingLevelMap when present (pi-ai 0.72+ ships
@@ -1314,30 +1392,25 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 	// cliModel is the actual id sent to CodeBuddy (may carry [1m]); model.id is the
 	// pi-registered id. Log cliModel so debug lines reflect what CC actually received.
 	const cliModel = codebuddyModelId(model);
-	const extraArgs: Record<string, string | null> = { model: cliModel };
-	if (strictMcpConfigEnabled) extraArgs["strict-mcp-config"] = null;
 
 	const childEnv = { ...process.env, DISABLE_AUTO_COMPACT: "1" };
-	const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
+	const queryOptions = buildProviderQueryOptions({
+		providerSettings,
+		cliModel,
 		cwd,
 		env: childEnv,
-		tools: [],
-		permissionMode: "bypassPermissions",
-		includePartialMessages: true,
 		systemPrompt,
-		extraArgs,
-		...(effort ? { effort } : {}),
-		...(settingSources ? { settingSources } : {}),
-		...(mcpServers ? { mcpServers } : {}),
-		...(resumeSessionId ? { resume: resumeSessionId } : {}),
-		...(codebuddyExecutable ? { pathToCodebuddyCode: codebuddyExecutable } : {}),
-		...makeCliDebugOptions("provider"),
-	};
+		effort,
+		mcpServers,
+		resumeSessionId,
+		codebuddyExecutable,
+		debugOptions: makeCliDebugOptions("provider"),
+	});
 
 	debug("provider: fresh query",
 		`model=${cliModel} msgs=${context.messages.length} tools=${mcpTools.length}`,
 		`resume=${resumeSessionId?.slice(0, 8) ?? "none"} effort=${effort ?? "default"}`,
-		`appendSys=${appendSystemPrompt} strictMcp=${strictMcpConfigEnabled}`,
+		`appendSys=${appendSystemPrompt} strictMcp=${boundaryOptions.strictMcpConfigEnabled}`,
 		`promptLen=${promptText.length}${promptBlocks ? " [+images]" : ""}`);
 
 	// 3. Start SDK query (wait for model discovery + serialize SDK subprocess access)
@@ -1497,22 +1570,13 @@ async function promptAndWait(
 	const modelId = model?.id ?? requestedModel;
 	const cliModel = model ? codebuddyModelId(model) : modelId;
 
-	// Session resume for shared mode — reuse provider's session if it exists,
-	// otherwise create one from pi's context.
-	// Note: doesn't update sharedSession.cursor after completion, so the next
-	// provider call will see missed messages and trigger a Case 4 rebuild.
+	// Session resume for shared mode: create a delegation-only session from Pi's
+	// conversation context. Do not reuse or mutate the provider sharedSession;
+	// provider sessions contain Provider Tool Guidance and Pi MCP tool history,
+	// which must not leak into AskCodebuddy's Delegation Path.
 	let resumeSessionId: string | null = null;
 	if (!options?.isolated && options?.context?.length) {
-		if (sharedSession) {
-			// Provider already has a session — just resume from it
-			// Any missed messages from other providers were already handled by the provider's Case 4
-			resumeSessionId = sharedSession.sessionId;
-		} else {
-			// No provider session yet — create one from pi's context
-			const contextWithPrompt = [...options.context, { role: "user" as const, content: prompt, timestamp: Date.now() }];
-			const sync = syncSharedSession(contextWithPrompt as Context["messages"], cwd, undefined, modelId);
-			resumeSessionId = sync.sessionId;
-		}
+		resumeSessionId = createDelegationSessionFromContext(options.context, cwd, modelId);
 	}
 
 	// Mode → disallowed tools
@@ -1521,6 +1585,7 @@ async function promptAndWait(
 	const askSystemPrompt = options?.systemPrompt
 		? buildCodebuddySystemPrompt(options.systemPrompt, {
 			includeSkills: options.appendSkills !== false,
+			includeToolBridge: false,
 		})
 		: undefined;
 

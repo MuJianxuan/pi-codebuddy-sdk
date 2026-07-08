@@ -5,7 +5,7 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { extractSkillsBlock } from "../src/skills.js";
+import { buildPiToolBridgeInstruction, enhancePiToolForCodebuddy, extractSkillsBlock } from "../src/skills.js";
 
 // Realistic pi system prompt with skills block
 const SYSTEM_PROMPT = `You are a coding assistant.
@@ -59,5 +59,65 @@ describe("skills block extraction", () => {
 	it("malformed: start marker but no end marker → undefined", () => {
 		const partial = "The following skills provide specialized instructions for specific tasks.\nBut no closing tag.";
 		assert.strictEqual(extractSkillsBlock(partial), undefined);
+	});
+});
+
+describe("enhancePiToolForCodebuddy", () => {
+	it("adds guidance for built-in Pi file and shell tools", () => {
+		const read = enhancePiToolForCodebuddy({
+			name: "read",
+			description: "Read a file.",
+			parameters: { type: "object", required: ["path"], properties: { path: { type: "string" } } },
+		});
+		assert.equal(read.name, "read");
+		assert.equal(read.parameters.required[0], "path");
+		assert.ok(read.description.includes("Read a file."));
+		assert.ok(read.description.includes("CodeBuddy guidance:"));
+		assert.ok(read.description.includes("inspect file contents"));
+
+		const edit = enhancePiToolForCodebuddy({ name: "edit", description: "Edit a file." });
+		assert.ok(edit.description.includes("oldText/old_string value must exactly match"));
+	});
+
+	it("leaves custom tools unchanged", () => {
+		const custom = { name: "DeployPreview", description: "Deploy a preview.", parameters: { type: "object" } };
+		const result = enhancePiToolForCodebuddy(custom);
+		assert.strictEqual(result, custom);
+		assert.equal(result.description, "Deploy a preview.");
+	});
+
+	it("does not duplicate guidance", () => {
+		const tool = {
+			name: "bash",
+			description: "Run a command.\n\nCodeBuddy guidance: already present.",
+		};
+		const result = enhancePiToolForCodebuddy(tool);
+		assert.strictEqual(result, tool);
+		assert.equal(result.description.match(/CodeBuddy guidance:/g).length, 1);
+	});
+});
+
+describe("buildPiToolBridgeInstruction", () => {
+	it("mentions only available built-in tools", () => {
+		const result = buildPiToolBridgeInstruction({ availableToolNames: ["read", "bash"] });
+		assert.ok(result.includes("mcp__custom_tools__read"));
+		assert.ok(result.includes("mcp__custom_tools__bash"));
+		assert.ok(!result.includes("mcp__custom_tools__edit"));
+		assert.ok(!result.includes("mcp__custom_tools__write"));
+		assert.ok(result.includes("Prefer it over shelling out to cat/sed"));
+	});
+
+	it("handles no available Pi tools without suggesting tool calls", () => {
+		const result = buildPiToolBridgeInstruction({ availableToolNames: [] });
+		assert.ok(result.includes("No Pi tools are currently available"));
+		assert.ok(!result.includes("Tool selection rules:"));
+		assert.ok(!result.includes("mcp__custom_tools__read"));
+	});
+
+	it("does not copy active tool descriptions into bridge guidance", () => {
+		const description = "THIS_SINGLE_TOOL_DESCRIPTION_SHOULD_NOT_APPEAR";
+		const result = buildPiToolBridgeInstruction({ availableToolNames: ["read", description] });
+		assert.ok(result.includes("mcp__custom_tools__read"));
+		assert.ok(!result.includes(description));
 	});
 });

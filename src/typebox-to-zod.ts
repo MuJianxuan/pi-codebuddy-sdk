@@ -12,18 +12,20 @@
 import { z } from "zod";
 
 type JsonSchema = Record<string, unknown>;
+type JsonLiteral = string | number | boolean | null;
 
 function withDescription(schema: z.ZodTypeAny, prop: JsonSchema): z.ZodTypeAny {
 	if (typeof prop.description === "string") return schema.describe(prop.description);
 	return schema;
 }
 
+function isJsonLiteral(value: unknown): value is JsonLiteral {
+	return value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean";
+}
+
 function literalSchema(value: unknown): z.ZodTypeAny {
 	if (
-		value === null ||
-		typeof value === "string" ||
-		typeof value === "number" ||
-		typeof value === "boolean"
+		isJsonLiteral(value)
 	) {
 		return z.literal(value);
 	}
