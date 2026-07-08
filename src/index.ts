@@ -15,8 +15,17 @@ import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
 import { QueryContext, ctx } from "./query-state.js";
 import { loadConfig, type Config } from "./config.js";
-import { jsonSchemaToZodShape } from "./typebox-to-zod.js";
+import { jsonSchemaToZodObject } from "./typebox-to-zod.js";
 import { buildActionSummary, type ToolCallState } from "./askcodebuddy-ui.js";
+import {
+	applyContextWindowCalibrations,
+	buildCalibrationEnvironment,
+	loadCalibrationCache,
+	recordObservedContextWindow,
+	saveCalibrationCache,
+	type CalibrationCache,
+	type CalibrationEnvironment,
+} from "./model-calibration.js";
 import { withSdkGate } from "./sdk-gate.js";
 
 // Compat (#2): use factory if available (pi-ai ≥0.66), else fall back to constructor (gsd-pi etc.)
@@ -123,6 +132,9 @@ const SDK_TO_PI_TOOL_NAME: Record<string, string> = {
 
 let MODELS: PiModel[] = buildModels(FALLBACK_MODELS);
 let providerSettings: NonNullable<Config["provider"]> = {};
+let calibrationEnvironment: CalibrationEnvironment = buildCalibrationEnvironment();
+let calibrationCache: CalibrationCache = loadCalibrationCache();
+let calibrationRefreshPending = false;
 
 type ContentBlockParam =
 	| { type: "text"; text: string }
@@ -131,6 +143,44 @@ type SettingSource = "user" | "project" | "local";
 
 function resolveModel(input: string) {
 	return _resolveModel(MODELS, input);
+}
+
+function applyModelCalibrations(models: PiModel[]): PiModel[] {
+	return buildModels(applyContextWindowCalibrations(models, calibrationCache, calibrationEnvironment));
+}
+
+function registerCurrentProvider(pi: ExtensionAPI): void {
+	const g = globalThis as Record<symbol, any>;
+	const streamFn = g[ACTIVE_STREAM_SIMPLE_KEY] ?? streamCodebuddySdk;
+	pi.registerProvider(PROVIDER_ID, {
+		name: "CodeBuddy",
+		baseUrl: PROVIDER_ID,
+		apiKey: "not-used",
+		api: "codebuddy-sdk",
+		models: MODELS as any,
+		streamSimple: streamFn as any,
+	});
+}
+
+function scheduleCalibrationRefresh(reason: string): void {
+	calibrationRefreshPending = true;
+	debug(`calibration: scheduled provider refresh (${reason})`);
+	queueMicrotask(() => maybeRefreshProviderRegistration(`microtask:${reason}`));
+}
+
+function maybeRefreshProviderRegistration(reason: string): void {
+	if (!calibrationRefreshPending || !piApi) return;
+	if (activeQueryContexts.size > 0) {
+		debug(`calibration: refresh deferred (${reason}) activeQueries=${activeQueryContexts.size}`);
+		return;
+	}
+	calibrationRefreshPending = false;
+	try {
+		debug(`calibration: refreshing provider registration (${reason}) models=${MODELS.length}`);
+		registerCurrentProvider(piApi);
+	} catch (err) {
+		debug(`calibration: provider refresh failed (${reason})`, err);
+	}
 }
 
 // --- Error handling ---
@@ -711,7 +761,7 @@ function buildMcpServers(tools: Tool[], queryCtx: QueryContext): Record<string, 
 	const mcpTools = tools.map((tool) => ({
 		name: tool.name,
 		description: tool.description,
-		inputSchema: jsonSchemaToZodShape(tool.parameters),
+		inputSchema: jsonSchemaToZodObject(tool.parameters),
 		handler: async () => {
 			const toolCallId = queryCtx.turnToolCallIds[queryCtx.nextHandlerIdx++];
 			if (!toolCallId) debug(`WARNING: mcp handler ${tool.name} has no toolCallId (idx=${queryCtx.nextHandlerIdx - 1}, available=${queryCtx.turnToolCallIds.length})`);
@@ -760,6 +810,39 @@ function logServedContextWindow(label: string, message: CbMessage, model: Model<
 	if (!modelUsage) return;
 	for (const [k, v] of Object.entries(modelUsage)) {
 		debug(`${label}: served contextWindow=${v.contextWindow ?? "?"} maxOutputTokens=${v.maxOutputTokens ?? "?"} servedModel=${k} registered=${model.contextWindow}`);
+		if (typeof v.contextWindow === "number") observeServedContextWindow(label, k, v.contextWindow, model);
+	}
+}
+
+function observeServedContextWindow(label: string, servedModel: string, observed: number, model: Model<any>): void {
+	if (!Number.isFinite(observed) || observed <= 0) return;
+	try {
+		const previousRegistered = MODELS.find((candidate) => candidate.id === model.id)?.contextWindow;
+		const { changed, floorChanged, record } = recordObservedContextWindow(
+			calibrationCache,
+			model.id,
+			calibrationEnvironment,
+			observed,
+		);
+		if (!changed) return;
+		saveCalibrationCache(calibrationCache);
+		const floor = record.capabilities.contextWindow?.floor;
+		if (floor != null) {
+			MODELS = MODELS.map((candidate) => (
+				candidate.id === model.id
+					? { ...candidate, contextWindow: floor }
+					: candidate
+			));
+		}
+		debug(
+			`calibration: ${label} observed=${observed} floor=${record.capabilities.contextWindow?.floor ?? "?"} ` +
+			`latest=${record.capabilities.contextWindow?.latest ?? "?"} servedModel=${servedModel} registeredBefore=${previousRegistered ?? "?"}`,
+		);
+		if (floorChanged && floor != null && previousRegistered != null && floor !== previousRegistered) {
+			scheduleCalibrationRefresh(`contextWindow:${model.id}`);
+		}
+	} catch (err) {
+		debug(`calibration: failed to persist observed context window for ${model.id}`, err);
 	}
 }
 
@@ -1384,6 +1467,7 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 				queryCtx.activeQuery = null;
 			}
 			activeQueryContexts.delete(queryCtx);
+			maybeRefreshProviderRegistration(`query-finished:${cliModel}`);
 		}
 	})();
 
@@ -1568,21 +1652,23 @@ let discoverInFlight: Promise<void> | null = null;
 async function discoverModels(pi: ExtensionAPI): Promise<void> {
 	await withSdkGate(async () => {
 		try {
-			const q = query({ prompt: " ", options: { maxTurns: 0, permissionMode: "bypassPermissions", tools: [] } });
+			const codebuddyExecutable = providerSettings.pathToCodebuddyCode;
+			const q = query({
+				prompt: " ",
+				options: {
+					maxTurns: 0,
+					permissionMode: "bypassPermissions",
+					tools: [],
+					env: { ...process.env, DISABLE_AUTO_COMPACT: "1" },
+					...(codebuddyExecutable ? { pathToCodebuddyCode: codebuddyExecutable } : {}),
+					...makeCliDebugOptions("supported-models"),
+				},
+			});
 			const supported = await q.supportedModels();
 			await q.return().catch(() => {});
 			if (!supported.length) return;
-			MODELS = buildModels(rawModelsFromSdk(supported as any));
-			const g = globalThis as Record<symbol, any>;
-			const streamFn = g[ACTIVE_STREAM_SIMPLE_KEY] ?? streamCodebuddySdk;
-			pi.registerProvider(PROVIDER_ID, {
-				name: "CodeBuddy",
-				baseUrl: PROVIDER_ID,
-				apiKey: "not-used",
-				api: "codebuddy-sdk",
-				models: MODELS as any,
-				streamSimple: streamFn as any,
-			});
+			MODELS = applyModelCalibrations(rawModelsFromSdk(supported as any));
+			registerCurrentProvider(pi);
 			modelsDiscovered = true;
 			debug(`discoverModels: registered ${MODELS.length} models from SDK`);
 		} catch (err) {
@@ -1602,9 +1688,9 @@ export default function (pi: ExtensionAPI) {
 	const config = loadConfig(process.cwd());
 	debug("loadConfig:", JSON.stringify(config));
 	providerSettings = config.provider ?? {};
-	const registeredModels = MODELS;
-
-	discoverInFlight = discoverModels(pi);
+	calibrationEnvironment = buildCalibrationEnvironment(providerSettings.pathToCodebuddyCode);
+	calibrationCache = loadCalibrationCache();
+	MODELS = applyModelCalibrations(buildModels(FALLBACK_MODELS));
 
 	const clearSession = (event: string) => {
 		debug(`${event}: clearing session ${sharedSession?.sessionId?.slice(0, 8) ?? "none"}`);
@@ -1687,15 +1773,8 @@ export default function (pi: ExtensionAPI) {
 	if (!g[ACTIVE_STREAM_SIMPLE_KEY]) {
 		// First instance: store our streamSimple and register.
 		g[ACTIVE_STREAM_SIMPLE_KEY] = streamCodebuddySdk;
-		pi.registerProvider(PROVIDER_ID, {
-			name: "CodeBuddy",
-			baseUrl: PROVIDER_ID,
-			apiKey: "not-used",
-			api: "codebuddy-sdk",
-			models: registeredModels as any,
-			// Cast: pi-ai AssistantMessageEventStream diamond dep between pi-coding-agent and pi-agent-core
-			streamSimple: streamCodebuddySdk as any,
-		});
+		registerCurrentProvider(pi);
+		discoverInFlight = discoverModels(pi);
 	} else {
 		// Subsequent instance (subagent session): skip registration entirely.
 		// The subagent already has access to codebuddy-sdk models via the shared

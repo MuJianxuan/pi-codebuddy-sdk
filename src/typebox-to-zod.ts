@@ -11,32 +11,148 @@
 
 import { z } from "zod";
 
-export function jsonSchemaPropertyToZod(prop: Record<string, unknown>): z.ZodTypeAny {
-	let base: z.ZodTypeAny;
-	if (Array.isArray(prop.enum)) base = z.enum(prop.enum as [string, ...string[]]);
-	else switch (prop.type) {
-		case "string": base = z.string(); break;
-		case "number": case "integer": base = z.number(); break;
-		case "boolean": base = z.boolean(); break;
-		case "array": base = prop.items
-			? z.array(jsonSchemaPropertyToZod(prop.items as Record<string, unknown>))
-			: z.array(z.unknown()); break;
-		case "object": base = z.record(z.string(), z.unknown()); break;
-		default: base = z.unknown();
+type JsonSchema = Record<string, unknown>;
+
+function withDescription(schema: z.ZodTypeAny, prop: JsonSchema): z.ZodTypeAny {
+	if (typeof prop.description === "string") return schema.describe(prop.description);
+	return schema;
+}
+
+function literalSchema(value: unknown): z.ZodTypeAny {
+	if (
+		value === null ||
+		typeof value === "string" ||
+		typeof value === "number" ||
+		typeof value === "boolean"
+	) {
+		return z.literal(value);
 	}
-	if (typeof prop.description === "string") base = base.describe(prop.description);
-	return base;
+	return z.unknown();
+}
+
+function unionSchema(schemas: z.ZodTypeAny[]): z.ZodTypeAny {
+	if (schemas.length === 0) return z.unknown();
+	if (schemas.length === 1) return schemas[0];
+	return z.union(schemas as [z.ZodTypeAny, z.ZodTypeAny, ...z.ZodTypeAny[]]);
+}
+
+function intersectionSchema(schemas: z.ZodTypeAny[]): z.ZodTypeAny {
+	if (schemas.length === 0) return z.unknown();
+	if (schemas.length === 1) return schemas[0];
+	return schemas.slice(1).reduce((left, right) => z.intersection(left, right), schemas[0]);
+}
+
+function objectSchema(prop: JsonSchema): z.ZodTypeAny {
+	const shape = jsonSchemaToZodShape(prop);
+	const additionalPropertiesSchema =
+		prop.additionalProperties && typeof prop.additionalProperties === "object"
+			? jsonSchemaPropertyToZod(prop.additionalProperties as JsonSchema)
+			: undefined;
+	if (Object.keys(shape).length > 0) {
+		const base = z.object(shape);
+		if (prop.additionalProperties === false) return base.strict();
+		if (additionalPropertiesSchema) return base.catchall(additionalPropertiesSchema);
+		return base.passthrough();
+	}
+	if (additionalPropertiesSchema) return z.record(z.string(), additionalPropertiesSchema);
+	if (prop.additionalProperties === false) return z.object({}).strict();
+	return z.record(z.string(), z.unknown());
+}
+
+export function jsonSchemaPropertyToZod(prop: JsonSchema): z.ZodTypeAny {
+	let base: z.ZodTypeAny;
+
+	if (prop.const !== undefined) {
+		base = literalSchema(prop.const);
+		if (prop.nullable === true) base = base.nullable();
+		return withDescription(base, prop);
+	}
+
+	if (Array.isArray(prop.enum)) {
+		base = unionSchema(prop.enum.map((value) => literalSchema(value)));
+		if (prop.nullable === true) base = base.nullable();
+		return withDescription(base, prop);
+	}
+
+	if (Array.isArray(prop.oneOf)) {
+		base = unionSchema(prop.oneOf.map((item) => jsonSchemaPropertyToZod(item as JsonSchema)));
+		if (prop.nullable === true) base = base.nullable();
+		return withDescription(base, prop);
+	}
+
+	if (Array.isArray(prop.anyOf)) {
+		base = unionSchema(prop.anyOf.map((item) => jsonSchemaPropertyToZod(item as JsonSchema)));
+		if (prop.nullable === true) base = base.nullable();
+		return withDescription(base, prop);
+	}
+
+	if (Array.isArray(prop.allOf)) {
+		base = intersectionSchema(prop.allOf.map((item) => jsonSchemaPropertyToZod(item as JsonSchema)));
+		if (prop.nullable === true) base = base.nullable();
+		return withDescription(base, prop);
+	}
+
+	if (Array.isArray(prop.type)) {
+		const allowsNull = prop.type.includes("null");
+		const schemas = prop.type
+			.filter((value): value is string => typeof value === "string" && value !== "null")
+			.map((value) => jsonSchemaPropertyToZod({ ...prop, type: value, nullable: false }));
+		base = unionSchema(schemas);
+		base = allowsNull ? base.nullable() : base;
+		return withDescription(base, prop);
+	}
+
+	const propType = typeof prop.type === "string" ? prop.type : undefined;
+	switch (propType) {
+		case "string":
+			base = z.string();
+			break;
+		case "number":
+		case "integer":
+			base = z.number();
+			break;
+		case "boolean":
+			base = z.boolean();
+			break;
+		case "array":
+			base = prop.items
+				? z.array(jsonSchemaPropertyToZod(prop.items as JsonSchema))
+				: z.array(z.unknown());
+			break;
+		case "object":
+			base = objectSchema(prop);
+			break;
+		case "null":
+			base = z.null();
+			break;
+		default:
+			if (prop.properties) base = objectSchema(prop);
+			else base = z.unknown();
+	}
+
+	if (prop.nullable === true) base = base.nullable();
+	return withDescription(base, prop);
 }
 
 export function jsonSchemaToZodShape(schema: unknown): Record<string, z.ZodTypeAny> {
-	const s = schema as Record<string, unknown>;
-	if (!s || s.type !== "object" || !s.properties) return {};
-	const props = s.properties as Record<string, Record<string, unknown>>;
-	const required = new Set(Array.isArray(s.required) ? s.required as string[] : []);
+	const s = schema as JsonSchema;
+	const objectSchemas = [s, ...(Array.isArray(s?.allOf) ? s.allOf as JsonSchema[] : [])]
+		.filter((item) => item && typeof item === "object" && ((item as JsonSchema).type === "object" || (item as JsonSchema).properties));
+	if (objectSchemas.length === 0) return {};
+
 	const shape: Record<string, z.ZodTypeAny> = {};
-	for (const [key, prop] of Object.entries(props)) {
-		const zodProp = jsonSchemaPropertyToZod(prop);
-		shape[key] = required.has(key) ? zodProp : zodProp.optional();
+	for (const objectSchemaPart of objectSchemas) {
+		const props = objectSchemaPart.properties as Record<string, JsonSchema> | undefined;
+		if (!props) continue;
+		const required = new Set(Array.isArray(objectSchemaPart.required) ? objectSchemaPart.required as string[] : []);
+		for (const [key, prop] of Object.entries(props)) {
+			const zodProp = jsonSchemaPropertyToZod(prop);
+			shape[key] = required.has(key) ? zodProp : zodProp.optional();
+		}
 	}
 	return shape;
+}
+
+export function jsonSchemaToZodObject(schema: unknown): z.ZodTypeAny {
+	return jsonSchemaPropertyToZod(schema as JsonSchema);
 }

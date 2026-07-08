@@ -1,5 +1,4 @@
 // Dynamic model list from CodeBuddy SDK supportedModels().
-
 import type { ModelInfo } from "@tencent-ai/agent-sdk";
 
 export type PiModel = {
@@ -13,7 +12,8 @@ export type PiModel = {
 	cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
 };
 
-const DEFAULT_CONTEXT = 131_072;
+const CONSERVATIVE_DEFAULT_CONTEXT = 65_536;
+const CONSERVATIVE_GEMINI_CONTEXT = 131_072;
 const DEFAULT_MAX_TOKENS = 8192;
 
 function detectThinking(id: string): boolean {
@@ -24,14 +24,13 @@ function detectImages(id: string): boolean {
 	return /claude|gemini|gpt/i.test(id);
 }
 
-function estimateContext(id: string): number {
+export function conservativeContextWindow(id: string): number {
 	const lower = id.toLowerCase();
-	if (lower.includes("gemini")) return 1_048_576;
-	if (lower.includes("claude") || lower.includes("gpt")) return 200_000;
-	return DEFAULT_CONTEXT;
+	if (lower.includes("gemini")) return CONSERVATIVE_GEMINI_CONTEXT;
+	return CONSERVATIVE_DEFAULT_CONTEXT;
 }
 
-function estimateMaxTokens(id: string): number {
+export function conservativeMaxTokens(id: string): number {
 	if (id.toLowerCase().includes("gpt")) return 16_384;
 	return DEFAULT_MAX_TOKENS;
 }
@@ -41,18 +40,26 @@ export function rawModelsFromSdk(supported: Array<ModelInfo & { id?: string; nam
 		.map((m) => ({ id: m.id ?? m.value, name: m.name ?? m.displayName ?? m.id ?? m.value }))
 		.filter((m) => m.id)
 		.map((m) => ({
-		id: m.id!,
-		name: m.name || m.id!,
-		reasoning: detectThinking(m.id!),
-		input: detectImages(m.id!) ? ["text", "image"] as const : ["text"] as const,
-		contextWindow: estimateContext(m.id!),
-		maxTokens: estimateMaxTokens(m.id!),
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-	}));
+			id: m.id!,
+			name: m.name || m.id!,
+			reasoning: detectThinking(m.id!),
+			input: detectImages(m.id!) ? ["text", "image"] as const : ["text"] as const,
+			contextWindow: conservativeContextWindow(m.id!),
+			maxTokens: conservativeMaxTokens(m.id!),
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		}));
 }
 
 export const FALLBACK_MODELS: PiModel[] = [
-	{ id: "hy3-preview-agent-ioa", name: "Hunyuan 3 Preview", reasoning: true, input: ["text"], contextWindow: DEFAULT_CONTEXT, maxTokens: DEFAULT_MAX_TOKENS, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } },
+	{
+		id: "hy3-preview-agent-ioa",
+		name: "Hunyuan 3 Preview",
+		reasoning: true,
+		input: ["text"],
+		contextWindow: conservativeContextWindow("hy3-preview-agent-ioa"),
+		maxTokens: DEFAULT_MAX_TOKENS,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	},
 ];
 
 export function buildModels(models: PiModel[]): PiModel[] {

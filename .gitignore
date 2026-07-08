@@ -7,6 +7,8 @@ node_modules/
 .env.*
 !.env.test.example
 
+.pi
+
 # Test and local artifacts (may contain session metadata — never commit)
 .test-output/
 .plans/

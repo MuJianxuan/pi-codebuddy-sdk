@@ -8,6 +8,7 @@ Pi extension that registers **CodeBuddy** as a model provider. You keep using Pi
 - Bridges Pi tools to the SDK (Pi still executes tools; CodeBuddy only plans and calls them)
 - Forwards Pi's system prompt, skills, and project `AGENTS.md` so the model acts as Pi—not as standalone CodeBuddy Code
 - Supports session resume, compaction, streaming, thinking levels, and images
+- Learns runtime-served context windows over time and keeps Pi's registered model metadata conservatively aligned with observed reality
 - Optional **AskCodebuddy** tool to delegate a focused sub-task to another CodeBuddy call
 
 ## Install
@@ -116,6 +117,7 @@ export CODEBUDDY_SDK_DEBUG=1
 ```
 
 Default log: `~/.pi/agent/codebuddy-sdk.log`. See [CONTRIBUTING.md](CONTRIBUTING.md) for maintainer details.
+Runtime calibration cache: `~/.pi/agent/codebuddy-sdk-model-calibration.json` stores observed model capability floors per runtime environment.
 
 ## Development
 

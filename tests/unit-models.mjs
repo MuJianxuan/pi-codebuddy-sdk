@@ -3,7 +3,14 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { buildModels, codebuddyModelId, rawModelsFromSdk, resolveModel, FALLBACK_MODELS } from "../src/models.js";
+import {
+	buildModels,
+	codebuddyModelId,
+	conservativeContextWindow,
+	rawModelsFromSdk,
+	resolveModel,
+	FALLBACK_MODELS,
+} from "../src/models.js";
 
 describe("rawModelsFromSdk", () => {
 	it("maps SDK ModelInfo to pi models", () => {
@@ -16,6 +23,14 @@ describe("rawModelsFromSdk", () => {
 		assert.deepEqual(models[0].cost, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
 	});
 });
+
+	describe("conservativeContextWindow", () => {
+		it("uses family-bounded conservative defaults", () => {
+			assert.equal(conservativeContextWindow("gemini-2.5-pro"), 131_072);
+			assert.equal(conservativeContextWindow("claude-sonnet-4.6"), 65_536);
+			assert.equal(conservativeContextWindow("hy3-preview-agent-ioa"), 65_536);
+		});
+	});
 
 describe("buildModels", () => {
 	it("preserves order from SDK", () => {
