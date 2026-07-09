@@ -79,17 +79,28 @@ Pick any entry prefixed with `codebuddy/` (for example `codebuddy/hy3-preview-ag
 
 Tools, skills, extensions, `/compact`, and steer behave the same as with other Pi providers.
 
+### AskCodebuddy
+
+When the AskCodebuddy tool is enabled (default), any provider can delegate a focused sub-task to a separate CodeBuddy call. This is the **Delegation Path** — unlike the main Provider Path, CodeBuddy runs its own native tools directly (not Pi-bridged MCP tools).
+
+- `"read"` mode (default): codebase questions — review, analysis, explain.
+- `"full"` mode: allows writing and bash execution (runs without feedback to Pi — use with care).
+- `"none"` mode: general knowledge only (no file access).
+
+AskCodebuddy is blocked automatically when the active provider is already `codebuddy/...` (prevents circular delegation).
+
 ## Configuration
 
 **Optional.** Defaults work for most users.
 
-File: `~/.pi/agent/codebuddy-sdk.json` or `.pi/codebuddy-sdk.json` in a project.
+File: `~/.pi/agent/codebuddy-sdk.json` (global) or `.pi/codebuddy-sdk.json` (project). Project config overrides global.
 
 ```json
 {
   "askCodebuddy": {
     "enabled": true,
-    "allowFullMode": true
+    "allowFullMode": true,
+    "defaultMode": "read"
   },
   "provider": {
     "appendSystemPrompt": true,
@@ -99,12 +110,29 @@ File: `~/.pi/agent/codebuddy-sdk.json` or `.pi/codebuddy-sdk.json` in a project.
 }
 ```
 
+### AskCodebuddy options
+
 | Option | Default | Meaning |
 |--------|---------|---------|
 | `askCodebuddy.enabled` | `true` | Register the AskCodebuddy delegation tool |
-| `askCodebuddy.allowFullMode` | `true` | Allow write-capable delegation mode |
-| `provider.appendSystemPrompt` | `true` | Use Pi's system prompt and Pi Tool Bridge guidance instead of CodeBuddy's default identity; disable only for debugging/compatibility |
-| `provider.strictMcpConfig` | `true` | Use only Pi-bridged MCP tools so Pi remains the tool execution boundary; disable only for debugging/compatibility |
+| `askCodebuddy.allowFullMode` | `true` | Allow write-capable (`"full"`) delegation mode |
+| `askCodebuddy.defaultMode` | `"read"` | Default delegation mode: `"read"` (file access), `"full"` (write + bash), or `"none"` (general knowledge) |
+| `askCodebuddy.defaultIsolated` | `false` | Default whether the delegation runs in a clean session (no conversation history) |
+| `askCodebuddy.appendSkills` | `true` | Include Pi skills block in the delegation system prompt |
+| `askCodebuddy.name` | `"AskCodebuddy"` | Tool name |
+| `askCodebuddy.label` | `"Ask CodeBuddy"` | Tool label shown in the Pi TUI |
+| `askCodebuddy.description` | auto | Tool description shown in Pi |
+
+### Provider options
+
+These control the main Provider Path (when you pick `codebuddy/...` in `/model`). Options marked **escape hatch** are not for everyday tuning — disable only for debugging or compatibility.
+
+| Option | Default | Meaning |
+|--------|---------|---------|
+| `provider.appendSystemPrompt` | `true` | Use Pi's system prompt and Pi Tool Bridge guidance instead of CodeBuddy's default identity (**escape hatch** — disabling re-enables CodeBuddy filesystem settings) |
+| `provider.strictMcpConfig` | `true` | Use only Pi-bridged MCP tools so Pi remains the tool execution boundary (**escape hatch**) |
+| `provider.serialToolCalls` | `true` | Force one tool call per turn; works around a CodeBuddy MCP client bug that drops arguments for parallel tool calls (**escape hatch** — disable only if your CodeBuddy version handles parallel calls correctly) |
+| `provider.settingSources` | `["user","project"]` | CodeBuddy filesystem settings to load; only used when `appendSystemPrompt=false` (**escape hatch**) |
 | `provider.pathToCodebuddyCode` | auto | Path to `codebuddy` when it is **not** on `PATH` |
 
 ## Privacy
