@@ -16,7 +16,7 @@ import assert from "node:assert/strict";
 import { ctx, resetStack } from "../src/query-state.js";
 import { __test } from "../src/index.js";
 
-const { isEmptyArgs } = __test;
+const { claimSerialToolUse, isEmptyArgs, processStreamEvent } = __test;
 
 const fakeModel = { api: "anthropic", provider: "anthropic", id: "test-model" };
 
@@ -137,6 +137,37 @@ describe("QueryContext argsPendingBlocks lifecycle", () => {
 
 describe("parallel tool-call backfill simulation", () => {
 	beforeEach(() => resetStack());
+
+	it("records each streamed tool_use id only once", () => {
+		ctx().resetTurnState(fakeModel);
+		const c = ctx();
+		const pushed = [];
+		c.currentPiStream = {
+			push(event) { pushed.push(event); },
+			end() {},
+		};
+
+		processStreamEvent({
+			event: {
+				type: "content_block_start",
+				index: 0,
+				content_block: {
+					type: "tool_use",
+					id: "t1",
+					name: "read",
+					input: { path: "/tmp/test.txt" },
+				},
+			},
+		}, new Map(), fakeModel, c);
+
+		assert.deepStrictEqual(c.turnToolCallIds, ["t1"]);
+		assert.strictEqual(c.turnBlocks.length, 1);
+		assert.strictEqual(c.turnBlocks[0].id, "t1");
+		assert.strictEqual(
+			pushed.filter((event) => event.type === "toolcall_start").length,
+			1,
+		);
+	});
 
 	it("simulates read+bash parallel call where bash args arrive empty in stream", () => {
 		ctx().resetTurnState(fakeModel);
@@ -535,5 +566,39 @@ describe("canUseTool pre-validation logic", () => {
 		const tools = [{ name: "bash", parameters: { type: "object", required: ["command"] } }];
 		const result = canUseToolDecision("bash", { command: null }, tools);
 		assert.strictEqual(result.behavior, "deny");
+	});
+});
+
+describe("serial tool-call gate", () => {
+	beforeEach(() => resetStack());
+
+	it("claims the first toolUseID in a turn", () => {
+		ctx().resetTurnState(fakeModel);
+		assert.strictEqual(claimSerialToolUse(ctx(), "toolu_1"), true);
+		assert.strictEqual(ctx().claimedToolUseId, "toolu_1");
+	});
+
+	it("allows repeated checks for the same toolUseID", () => {
+		ctx().resetTurnState(fakeModel);
+		assert.strictEqual(claimSerialToolUse(ctx(), "toolu_1"), true);
+		assert.strictEqual(claimSerialToolUse(ctx(), "toolu_1"), true);
+		assert.strictEqual(ctx().claimedToolUseId, "toolu_1");
+	});
+
+	it("denies a different toolUseID in the same turn", () => {
+		ctx().resetTurnState(fakeModel);
+		assert.strictEqual(claimSerialToolUse(ctx(), "toolu_1"), true);
+		assert.strictEqual(claimSerialToolUse(ctx(), "toolu_2"), false);
+		assert.strictEqual(ctx().claimedToolUseId, "toolu_1");
+	});
+
+	it("resets the claimed toolUseID between turns", () => {
+		ctx().resetTurnState(fakeModel);
+		assert.strictEqual(claimSerialToolUse(ctx(), "toolu_1"), true);
+
+		ctx().resetTurnState(fakeModel);
+		assert.strictEqual(ctx().claimedToolUseId, null);
+		assert.strictEqual(claimSerialToolUse(ctx(), "toolu_2"), true);
+		assert.strictEqual(ctx().claimedToolUseId, "toolu_2");
 	});
 });

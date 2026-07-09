@@ -41,6 +41,10 @@ export class QueryContext {
 	// Prevents double-deferral and lets the assistant-message path know it
 	// must emit the done event after backfilling.
 	doneDeferredForArgs = false;
+	// First toolUseID observed by canUseTool in this assistant turn.
+	// Any different toolUseID in the same turn is denied so provider-path
+	// tools always execute serially.
+	claimedToolUseId: string | null = null;
 
 	// Per-turn (reset together)
 	turnOutput: AssistantMessage | null = null;
@@ -66,6 +70,7 @@ export class QueryContext {
 		this.turnSawToolCall = false;
 		this.argsPendingBlocks = [];
 		this.doneDeferredForArgs = false;
+		this.claimedToolUseId = null;
 		this.matchedToolCallIds = new Set();
 		// turnToolCallIds and nextHandlerIdx are NOT reset — they persist across
 		// tool-result delivery callbacks within the same assistant message.

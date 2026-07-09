@@ -9,6 +9,7 @@ Pi extension that registers **CodeBuddy** as a model provider. You keep using Pi
 
 - Exposes CodeBuddy models in Pi (`codebuddy/...` in `/model`)
 - Bridges Pi tools to the SDK (Pi still executes tools; CodeBuddy only plans and calls them)
+- Enforces one bridged tool call per assistant turn on the main Provider Path for stability
 - Forwards Pi's system prompt, skills, and project `AGENTS.md` so the model acts as Pi—not as standalone CodeBuddy Code
 - Supports session resume, compaction, streaming, thinking levels, and images
 - Learns runtime-served context windows over time and keeps Pi's registered model metadata conservatively aligned with observed reality
@@ -131,7 +132,6 @@ These control the main Provider Path (when you pick `codebuddy/...` in `/model`)
 |--------|---------|---------|
 | `provider.appendSystemPrompt` | `true` | Use Pi's system prompt and Pi Tool Bridge guidance instead of CodeBuddy's default identity (**escape hatch** — disabling re-enables CodeBuddy filesystem settings) |
 | `provider.strictMcpConfig` | `true` | Use only Pi-bridged MCP tools so Pi remains the tool execution boundary (**escape hatch**) |
-| `provider.serialToolCalls` | `true` | Force one tool call per turn; works around a CodeBuddy MCP client bug that drops arguments for parallel tool calls (**escape hatch** — disable only if your CodeBuddy version handles parallel calls correctly) |
 | `provider.settingSources` | `["user","project"]` | CodeBuddy filesystem settings to load; only used when `appendSystemPrompt=false` (**escape hatch**) |
 | `provider.pathToCodebuddyCode` | auto | Path to `codebuddy` when it is **not** on `PATH` |
 

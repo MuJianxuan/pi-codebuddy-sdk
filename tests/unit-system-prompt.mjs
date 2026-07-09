@@ -48,21 +48,8 @@ describe("buildCodebuddySystemPrompt", () => {
 			availableToolNames: ["read", "bash"],
 		});
 		assert.ok(result?.includes("AT MOST ONE tool per turn"));
+		assert.ok(result?.includes("will be denied"));
 		assert.ok(result?.includes("Parallel tool calls are unsupported"));
-		// old parallel-guidance text must NOT appear in serial mode
-		assert.ok(!result?.includes("complete arguments"));
-		assert.ok(!result?.includes("When calling multiple tools in a single response"));
-	});
-
-	it("keeps parallel tool-call guidance when serialToolCalls=false", () => {
-		const result = buildCodebuddySystemPrompt(PI_PROMPT, {
-			includeAgents: false,
-			availableToolNames: ["read", "bash"],
-			serialToolCalls: false,
-		});
-		assert.ok(result?.includes("multiple tools in a single response"));
-		assert.ok(result?.includes("complete arguments"));
-		assert.ok(!result?.includes("AT MOST ONE tool per turn"));
 	});
 
 	it("does not include parallel tool-call guidance when only one tool available", () => {
@@ -70,6 +57,7 @@ describe("buildCodebuddySystemPrompt", () => {
 			includeAgents: false,
 			availableToolNames: ["read"],
 		});
+		assert.ok(result?.includes("AT MOST ONE tool per turn"));
 		assert.ok(!result?.includes("multiple tools in a single response"));
 	});
 

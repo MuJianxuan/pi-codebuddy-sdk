@@ -666,6 +666,8 @@ export const __test = {
 	syncSharedSession,
 	isEmptyArgs,
 	hasRequiredParams,
+	claimSerialToolUse,
+	processStreamEvent,
 };
 
 function createDelegationSessionFromContext(
@@ -700,13 +702,11 @@ function stripToolHistoryForDelegation(messages: Context["messages"]): Context["
 function buildProviderBoundaryOptions(settings: NonNullable<Config["provider"]>) {
 	const appendSystemPrompt = settings.appendSystemPrompt !== false;
 	const strictMcpConfigEnabled = settings.strictMcpConfig !== false;
-	const serialToolCalls = settings.serialToolCalls !== false;
 	const extraArgs: Record<string, string | null> = {};
 	if (strictMcpConfigEnabled) extraArgs["strict-mcp-config"] = null;
 	return {
 		appendSystemPrompt,
 		strictMcpConfigEnabled,
-		serialToolCalls,
 		tools: [] as string[],
 		extraArgs,
 		settingSources: appendSystemPrompt
@@ -781,6 +781,14 @@ function hasRequiredParams(toolName: string, tools: Tool[]): boolean {
 	if (!tool?.parameters) return false;
 	const required = (tool.parameters as Record<string, unknown>).required;
 	return Array.isArray(required) && required.length > 0;
+}
+
+function claimSerialToolUse(queryCtx: QueryContext, toolUseId: string): boolean {
+	if (!queryCtx.claimedToolUseId) {
+		queryCtx.claimedToolUseId = toolUseId;
+		return true;
+	}
+	return queryCtx.claimedToolUseId === toolUseId;
 }
 
 // Renames for CodeBuddy SDK param names that differ from pi's native names.
@@ -1137,7 +1145,6 @@ function processStreamEvent(
 			c.turnBlocks.push({ type: "thinking", thinking: "", thinkingSignature: "", index: event.index });
 			c.currentPiStream!.push({ type: "thinking_start", contentIndex: c.turnBlocks.length - 1, partial: c.turnOutput });
 		} else if (event.content_block?.type === "tool_use") {
-			c.turnToolCallIds.push(event.content_block.id);
 			c.turnToolCallIds.push(event.content_block.id);
 			c.turnBlocks.push({
 				type: "toolCall", id: event.content_block.id,
@@ -1583,7 +1590,7 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 	const boundaryOptions = buildProviderBoundaryOptions(providerSettings);
 	const appendSystemPrompt = boundaryOptions.appendSystemPrompt;
 	const systemPrompt = appendSystemPrompt
-		? buildCodebuddySystemPrompt(context.systemPrompt, { availableToolNames: mcpTools.map((tool) => tool.name), serialToolCalls: boundaryOptions.serialToolCalls })
+		? buildCodebuddySystemPrompt(context.systemPrompt, { availableToolNames: mcpTools.map((tool) => tool.name) })
 		: undefined;
 
 	// Provider Path keeps CodeBuddy inside Pi's tool boundary: no built-in SDK
@@ -1630,6 +1637,14 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 	const piTools = context.tools ?? [];
 	(queryOptions as SdkQueryOptions).canUseTool = async (toolName: string, input: Record<string, unknown>, opts) => {
 		const piName = mapToolName(toolName, customToolNameToPi);
+		if (!claimSerialToolUse(queryCtx, opts.toolUseID)) {
+			debug(`canUseTool: rejecting ${toolName}→${piName} — serial mode already claimed by ${queryCtx.claimedToolUseId} (toolUseId=${opts.toolUseID})`);
+			return {
+				behavior: "deny" as const,
+				message: `Only one tool call is allowed per assistant turn. Wait for the current tool result before calling another tool in a later turn.`,
+				toolUseID: opts.toolUseID,
+			};
+		}
 		const mappedArgs = mapToolArgs(piName, input);
 		if (isEmptyArgs(mappedArgs) && hasRequiredParams(piName, piTools)) {
 			debug(`canUseTool: rejecting ${toolName}→${piName} — empty args for tool with required params (toolUseId=${opts.toolUseID})`);
