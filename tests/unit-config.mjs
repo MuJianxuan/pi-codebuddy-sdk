@@ -47,7 +47,7 @@ describe("loadConfig", () => {
 			mkdirSync(globalDir, { recursive: true });
 			mkdirSync(projectDir, { recursive: true });
 			writeFileSync(join(globalDir, "codebuddy-sdk.json"), JSON.stringify({
-				provider: { plan: "pro", strictMcpConfig: true },
+				provider: { plan: "pro" },
 				askCodebuddy: { enabled: true, defaultMode: "read" },
 			}));
 			writeFileSync(join(projectDir, "codebuddy-sdk.json"), JSON.stringify({
@@ -56,7 +56,7 @@ describe("loadConfig", () => {
 			}));
 
 			assert.deepEqual(loadConfig(cwd), {
-				provider: { plan: "max", strictMcpConfig: true },
+				provider: { plan: "max" },
 				askCodebuddy: { enabled: false, defaultMode: "read" },
 			});
 		} finally {

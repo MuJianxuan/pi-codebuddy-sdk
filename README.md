@@ -105,7 +105,6 @@ File: `~/.pi/agent/codebuddy-sdk.json` (global) or `.pi/codebuddy-sdk.json` (pro
   },
   "provider": {
     "appendSystemPrompt": true,
-    "strictMcpConfig": true,
     "pathToCodebuddyCode": "/path/to/codebuddy"
   }
 }
@@ -131,9 +130,10 @@ These control the main Provider Path (when you pick `codebuddy/...` in `/model`)
 | Option | Default | Meaning |
 |--------|---------|---------|
 | `provider.appendSystemPrompt` | `true` | Use Pi's system prompt and Pi Tool Bridge guidance instead of CodeBuddy's default identity (**escape hatch** — disabling re-enables CodeBuddy filesystem settings) |
-| `provider.strictMcpConfig` | `true` | Use only Pi-bridged MCP tools so Pi remains the tool execution boundary (**escape hatch**) |
 | `provider.settingSources` | `["user","project"]` | CodeBuddy filesystem settings to load; only used when `appendSystemPrompt=false` (**escape hatch**) |
 | `provider.pathToCodebuddyCode` | auto | Path to `codebuddy` when it is **not** on `PATH` |
+
+The main Provider Path always runs with strict MCP enabled, so only the Pi-bridged MCP server is visible to CodeBuddy in provider mode.
 
 ## Privacy
 

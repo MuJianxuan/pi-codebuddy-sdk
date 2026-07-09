@@ -26,7 +26,7 @@ npm run typecheck
 | `src/skills.ts` | Forward Pi system prompt + rewrite skill `read` tool for MCP |
 | `src/sdk-gate.ts` | Serialize SDK subprocesses (model discovery) |
 
-CodeBuddy built-in tools are disabled (`tools: []`). Only Pi-bridged MCP tools are visible when `strictMcpConfig` is on (default).
+CodeBuddy built-in tools are disabled (`tools: []`). The main Provider Path always enables strict MCP, so only Pi-bridged MCP tools are visible there.
 
 ## npm scripts
 

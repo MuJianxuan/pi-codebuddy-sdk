@@ -52,7 +52,6 @@ describe("provider query boundary options", () => {
 		const options = __test.buildProviderQueryOptions({
 			providerSettings: {
 				appendSystemPrompt: false,
-				strictMcpConfig: false,
 				settingSources: ["local"],
 				pathToCodebuddyCode: "/opt/codebuddy",
 			},
@@ -65,7 +64,10 @@ describe("provider query boundary options", () => {
 
 		assert.deepEqual(options.tools, []);
 		assert.deepEqual(options.settingSources, ["local"]);
-		assert.deepEqual(options.extraArgs, { model: "codebuddy-opus" });
+		assert.deepEqual(options.extraArgs, {
+			"strict-mcp-config": null,
+			model: "codebuddy-opus",
+		});
 		assert.equal(options.pathToCodebuddyCode, "/opt/codebuddy");
 		assert.equal(options.effort, "high");
 	});

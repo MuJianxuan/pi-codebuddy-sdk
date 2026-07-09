@@ -702,14 +702,10 @@ function stripToolHistoryForDelegation(messages: Context["messages"]): Context["
 
 function buildProviderBoundaryOptions(settings: NonNullable<Config["provider"]>) {
 	const appendSystemPrompt = settings.appendSystemPrompt !== false;
-	const strictMcpConfigEnabled = settings.strictMcpConfig !== false;
-	const extraArgs: Record<string, string | null> = {};
-	if (strictMcpConfigEnabled) extraArgs["strict-mcp-config"] = null;
 	return {
 		appendSystemPrompt,
-		strictMcpConfigEnabled,
 		tools: [] as string[],
-		extraArgs,
+		extraArgs: { "strict-mcp-config": null } as Record<string, string | null>,
 		settingSources: appendSystemPrompt
 			? undefined
 			: settings.settingSources ?? ["user", "project"] as SettingSource[],
@@ -1665,7 +1661,7 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 	debug("provider: fresh query",
 		`model=${cliModel} msgs=${context.messages.length} tools=${mcpTools.length}`,
 		`resume=${resumeSessionId?.slice(0, 8) ?? "none"} effort=${effort ?? "default"}`,
-		`appendSys=${appendSystemPrompt} strictMcp=${boundaryOptions.strictMcpConfigEnabled}`,
+		`appendSys=${appendSystemPrompt} strictMcp=true`,
 		`promptLen=${promptText.length}${promptBlocks ? " [+images]" : ""}`);
 
 	// 3. Start SDK query (wait for model discovery + serialize SDK subprocess access)

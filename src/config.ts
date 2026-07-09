@@ -25,7 +25,6 @@ export interface Config {
 	provider?: {
 		appendSystemPrompt?: boolean;
 		settingSources?: SettingSource[];
-		strictMcpConfig?: boolean;
 		pathToCodebuddyCode?: string;
 	};
 }

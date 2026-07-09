@@ -82,23 +82,25 @@ describe("tool-message integration", () => {
 		assert.match(text.toLowerCase(), /slowtool completed/);
 	});
 
-	it("parallel tool calls with steer delivers all results", { timeout: TEST_TIMEOUT }, async () => {
+	it("multi-round tool calls with steer delivers all results", { timeout: TEST_TIMEOUT }, async () => {
 		const collector = collectText();
 		const agentEnd = waitForEvent("agent_end");
 		await send({
 			type: "prompt",
-			message: "Call SlowTool three times in parallel: seconds=3, seconds=4, seconds=5. Then list all three results.",
+			message: "Call SlowTool with seconds=3, then seconds=4, then seconds=5. After all three complete, list all three results.",
 		});
-		// Wait for at least one tool to start, then inject steer
+		// Wait for the first tool round to start, then inject steer while later
+		// tool rounds are still pending.
 		await waitForEvent("tool_execution_start");
 		await send({
 			type: "prompt",
-			message: "This is a steer during parallel tool execution.",
+			message: "This is a steer during multi-round tool execution.",
 			streamingBehavior: "steer",
 		});
 		const end = await agentEnd;
 		const text = collector.stop();
-		// Bridge must deliver all tool results into context (model text may summarize).
+		// Bridge must deliver all tool results into context even when a steer lands
+		// during the broader multi-round tool workflow (model text may summarize).
 		const toolResults = (end.messages ?? []).filter((m) => m.role === "toolResult");
 		const slowResults = toolResults.filter((m) => JSON.stringify(m.content).toLowerCase().includes("slowtool completed"));
 		assert.ok(

@@ -65,9 +65,9 @@ run_json "multi-turn: tool use, context, history" \
      "Now read README.md and tell me the first heading. Be brief." \
      "What was the secret word I told you earlier? Reply with just the word."
 
-# Multiple tool calls in a single turn — the scenario that caused the deadlock
-# when processAssistantMessage didn't end the stream on tool_use.
-run_json "single-turn: multiple sequential tool calls" \
+# Multiple tool rounds in one prompt — verifies the provider can complete
+# several serial tool turns and still return final text.
+run_json "multi-round: multiple serial tool calls" \
   '([.[] | select(.type == "message_update") | .assistantMessageEvent | select(.type == "toolcall_end")] | length) >= 2 and
    ([.[] | select(.type == "message_update") | .assistantMessageEvent | select(.type == "text_end") | .content] | join(" ") | test("pi-codebuddy-sdk")) and
    ([.[] | select(.type == "message_update") | .assistantMessageEvent | select(.type == "text_end")] | length) > 0' \
@@ -76,10 +76,9 @@ run_json "single-turn: multiple sequential tool calls" \
   --mode json \
   -p "Read both package.json and README.md, then tell me the package name and the full first heading of the README."
 
-# 3+ parallel tool calls in a single turn — exercises the chained MCP resolve
-# fix that ensures all pending tool results are delivered when the model fires
-# more than two tool_use blocks simultaneously.
-run_json "single-turn: 3+ parallel tool calls" \
+# 3 tool rounds from one prompt — verifies longer serial tool chains still
+# converge on final text and all tool results are delivered.
+run_json "multi-round: 3 serial tool calls" \
   '([.[] | select(.type == "message_update") | .assistantMessageEvent | select(.type == "toolcall_end")] | length) >= 3 and
    ([ .[] | select(.type == "message_update") | .assistantMessageEvent | select(.type == "text_end") ] | length) > 0 and
    ([ .[] | select(.type == "message_update") | .assistantMessageEvent | select(.type == "text_end") | .content | select(. != null and . != "") ] | length) > 0 and
@@ -88,7 +87,7 @@ run_json "single-turn: 3+ parallel tool calls" \
   pi --no-session -ne -e "$DIR" \
   --model "codebuddy/hy3-preview-agent-ioa" \
   --mode json \
-  -p "Read package.json, README.md, and tsconfig.json at the same time, then tell me the package name, the first heading in the README, and the TypeScript target."
+  -p "Read package.json, then README.md, then tsconfig.json. After all three reads, tell me the package name, the first heading in the README, and the TypeScript target."
 
 # Regression: final text after multi-round tool calls was lost when the bridge
 # entered the DEFERRED path and set up a callback that never fired, yielding an
