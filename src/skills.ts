@@ -20,6 +20,7 @@ const BUILTIN_TOOL_GUIDANCE: Record<string, string> = {
 
 export interface ToolBridgeInstructionOptions {
 	availableToolNames?: Iterable<string>;
+	serialToolCalls?: boolean;
 }
 
 function normalizeToolNames(names: Iterable<string> | undefined): Set<string> {
@@ -71,7 +72,16 @@ export function buildPiToolBridgeInstruction(options: ToolBridgeInstructionOptio
 	if (has("bash")) {
 		lines.push(`- Use \`${mcpName("bash")}\` only when file tools are insufficient, for search/test/build/git information, or when command execution is requested.`);
 	}
-	if (toolNames.size > 1) {
+	if (options.serialToolCalls !== false) {
+		// Force serial tool calls. CodeBuddy's MCP client drops arguments for
+		// 2nd+ parallel tool_call blocks in a single response: the
+		// content_block_stop for those blocks never arrives, so pi finalizes a
+		// dangling toolcall_start with empty {} args and the call fails
+		// validation. Instructing one-tool-per-turn avoids the failure at the
+		// source. The stream-side backfill defense cannot catch this because it
+		// keys off content_block_stop, which never fires for the dropped call.
+		lines.push("Call AT MOST ONE tool per turn. Never emit multiple tool_call blocks in a single response. Issue one tool call, wait for its result, then decide the next call in the following turn. Parallel tool calls are unsupported and will fail.");
+	} else if (toolNames.size > 1) {
 		lines.push("When calling multiple tools in a single response, ensure each tool_call has complete arguments — do not leave required fields empty or rely on defaults. Incomplete parallel tool calls will be rejected.");
 	}
 	lines.push("Tool arguments must match the Pi tool schema exactly. After a tool result, base the next step on that result; if it is an error, correct the call instead of assuming success.");
@@ -130,13 +140,13 @@ function applySkillsRewrite(systemPrompt: string): string {
 /** Pi system prompt as CodeBuddy override (replaces default "CodeBuddy Code" identity). */
 export function buildCodebuddySystemPrompt(
 	piSystemPrompt: string | undefined,
-	options?: { includeAgents?: boolean; includeSkills?: boolean; includeToolBridge?: boolean; availableToolNames?: Iterable<string> },
+	options?: { includeAgents?: boolean; includeSkills?: boolean; includeToolBridge?: boolean; availableToolNames?: Iterable<string>; serialToolCalls?: boolean },
 ): string | undefined {
 	const parts: string[] = [];
 	const includeToolBridge = options?.includeToolBridge !== false;
 
 	if (includeToolBridge) {
-		parts.push(buildPiToolBridgeInstruction({ availableToolNames: options?.availableToolNames }));
+		parts.push(buildPiToolBridgeInstruction({ availableToolNames: options?.availableToolNames, serialToolCalls: options?.serialToolCalls }));
 	}
 
 	if (piSystemPrompt) {

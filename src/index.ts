@@ -700,11 +700,13 @@ function stripToolHistoryForDelegation(messages: Context["messages"]): Context["
 function buildProviderBoundaryOptions(settings: NonNullable<Config["provider"]>) {
 	const appendSystemPrompt = settings.appendSystemPrompt !== false;
 	const strictMcpConfigEnabled = settings.strictMcpConfig !== false;
+	const serialToolCalls = settings.serialToolCalls !== false;
 	const extraArgs: Record<string, string | null> = {};
 	if (strictMcpConfigEnabled) extraArgs["strict-mcp-config"] = null;
 	return {
 		appendSystemPrompt,
 		strictMcpConfigEnabled,
+		serialToolCalls,
 		tools: [] as string[],
 		extraArgs,
 		settingSources: appendSystemPrompt
@@ -1581,7 +1583,7 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 	const boundaryOptions = buildProviderBoundaryOptions(providerSettings);
 	const appendSystemPrompt = boundaryOptions.appendSystemPrompt;
 	const systemPrompt = appendSystemPrompt
-		? buildCodebuddySystemPrompt(context.systemPrompt, { availableToolNames: mcpTools.map((tool) => tool.name) })
+		? buildCodebuddySystemPrompt(context.systemPrompt, { availableToolNames: mcpTools.map((tool) => tool.name), serialToolCalls: boundaryOptions.serialToolCalls })
 		: undefined;
 
 	// Provider Path keeps CodeBuddy inside Pi's tool boundary: no built-in SDK
