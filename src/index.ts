@@ -665,6 +665,7 @@ export const __test = {
 	buildProviderQueryOptions,
 	syncSharedSession,
 	isEmptyArgs,
+	hasRequiredParams,
 };
 
 function createDelegationSessionFromContext(
@@ -768,6 +769,16 @@ function isEmptyArgs(args: Record<string, unknown> | undefined | null): boolean 
 	// Treat an object with only undefined/null values as empty
 	const hasValue = Object.values(args).some((v) => v !== undefined && v !== null);
 	return !hasValue;
+}
+
+// Checks whether a Pi tool has any required parameters. Used by the canUseTool
+// pre-validation to decide whether empty dispatch args should be rejected.
+// If a tool has no required params, empty args are legitimate and should pass.
+function hasRequiredParams(toolName: string, tools: Tool[]): boolean {
+	const tool = tools.find((t) => t.name === toolName);
+	if (!tool?.parameters) return false;
+	const required = (tool.parameters as Record<string, unknown>).required;
+	return Array.isArray(required) && required.length > 0;
 }
 
 // Renames for CodeBuddy SDK param names that differ from pi's native names.
@@ -1605,6 +1616,29 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 		codebuddyExecutable,
 		debugOptions: makeCliDebugOptions("provider"),
 	});
+
+	// P4: canUseTool pre-validation — reject empty dispatch args at MCP layer
+	// before they reach pi. This is an early signal to CodeBuddy that args
+	// were dropped (parallel tool_call dispatch bug), giving the model a chance
+	// to regenerate proper args in the same turn rather than failing at pi-side
+	// validation and requiring a full retry.
+	//
+	// Only rejects when the tool has required params AND dispatch args are empty.
+	// Tools without required params (e.g. some MCP tools) pass through normally.
+	const piTools = context.tools ?? [];
+	(queryOptions as SdkQueryOptions).canUseTool = async (toolName: string, input: Record<string, unknown>, opts) => {
+		const piName = mapToolName(toolName, customToolNameToPi);
+		const mappedArgs = mapToolArgs(piName, input);
+		if (isEmptyArgs(mappedArgs) && hasRequiredParams(piName, piTools)) {
+			debug(`canUseTool: rejecting ${toolName}→${piName} — empty args for tool with required params (toolUseId=${opts.toolUseID})`);
+			return {
+				behavior: "deny" as const,
+				message: `Tool "${piName}" requires arguments but received empty input. This can happen with parallel tool calls. Please provide complete arguments for all required fields.`,
+				toolUseID: opts.toolUseID,
+			};
+		}
+		return { behavior: "allow" as const, toolUseID: opts.toolUseID };
+	};
 
 	debug("provider: fresh query",
 		`model=${cliModel} msgs=${context.messages.length} tools=${mcpTools.length}`,

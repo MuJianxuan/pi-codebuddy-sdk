@@ -456,3 +456,84 @@ function resolveToolCallIdByName(c, toolName) {
 	}
 	return undefined;
 }
+
+// --- canUseTool pre-validation (P4) ---
+
+describe("hasRequiredParams", () => {
+	const { hasRequiredParams } = __test;
+
+	it("returns false for a tool with no required array", () => {
+		const tools = [{ name: "foo", parameters: { type: "object", properties: { x: { type: "string" } } } }];
+		assert.strictEqual(hasRequiredParams("foo", tools), false);
+	});
+
+	it("returns false for a tool with empty required array", () => {
+		const tools = [{ name: "foo", parameters: { type: "object", properties: { x: { type: "string" } }, required: [] } }];
+		assert.strictEqual(hasRequiredParams("foo", tools), false);
+	});
+
+	it("returns true for a tool with required params", () => {
+		const tools = [{ name: "bash", parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } }];
+		assert.strictEqual(hasRequiredParams("bash", tools), true);
+	});
+
+	it("returns false for a tool not in the list", () => {
+		const tools = [{ name: "bash", parameters: { type: "object", required: ["command"] } }];
+		assert.strictEqual(hasRequiredParams("nonexistent", tools), false);
+	});
+
+	it("returns false for a tool with no parameters", () => {
+		const tools = [{ name: "foo", parameters: undefined }];
+		assert.strictEqual(hasRequiredParams("foo", tools), false);
+	});
+});
+
+describe("canUseTool pre-validation logic", () => {
+	const { hasRequiredParams, isEmptyArgs } = __test;
+
+	// Simulate the canUseTool decision logic without activating the full provider
+	function canUseToolDecision(toolName, input, tools) {
+		const mappedArgs = input; // simplified — mapToolArgs is a no-op for test tools
+		if (isEmptyArgs(mappedArgs) && hasRequiredParams(toolName, tools)) {
+			return { behavior: "deny", message: `Tool "${toolName}" requires arguments but received empty input.` };
+		}
+		return { behavior: "allow" };
+	}
+
+	it("denies empty args for a tool with required params", () => {
+		const tools = [{ name: "bash", parameters: { type: "object", required: ["command"] } }];
+		const result = canUseToolDecision("bash", {}, tools);
+		assert.strictEqual(result.behavior, "deny");
+		assert.match(result.message, /requires arguments/);
+	});
+
+	it("allows non-empty args for a tool with required params", () => {
+		const tools = [{ name: "bash", parameters: { type: "object", required: ["command"] } }];
+		const result = canUseToolDecision("bash", { command: "ls" }, tools);
+		assert.strictEqual(result.behavior, "allow");
+	});
+
+	it("allows empty args for a tool without required params", () => {
+		const tools = [{ name: "status", parameters: { type: "object", properties: {} } }];
+		const result = canUseToolDecision("status", {}, tools);
+		assert.strictEqual(result.behavior, "allow");
+	});
+
+	it("allows empty args when tool is not found (conservative allow)", () => {
+		const tools = [];
+		const result = canUseToolDecision("unknown", {}, tools);
+		assert.strictEqual(result.behavior, "allow");
+	});
+
+	it("denies undefined args for a tool with required params", () => {
+		const tools = [{ name: "read", parameters: { type: "object", required: ["path"] } }];
+		const result = canUseToolDecision("read", undefined, tools);
+		assert.strictEqual(result.behavior, "deny");
+	});
+
+	it("denies null-valued args for a tool with required params", () => {
+		const tools = [{ name: "bash", parameters: { type: "object", required: ["command"] } }];
+		const result = canUseToolDecision("bash", { command: null }, tools);
+		assert.strictEqual(result.behavior, "deny");
+	});
+});
