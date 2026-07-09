@@ -71,6 +71,9 @@ export function buildPiToolBridgeInstruction(options: ToolBridgeInstructionOptio
 	if (has("bash")) {
 		lines.push(`- Use \`${mcpName("bash")}\` only when file tools are insufficient, for search/test/build/git information, or when command execution is requested.`);
 	}
+	if (toolNames.size > 1) {
+		lines.push("When calling multiple tools in a single response, ensure each tool_call has complete arguments — do not leave required fields empty or rely on defaults. Incomplete parallel tool calls will be rejected.");
+	}
 	lines.push("Tool arguments must match the Pi tool schema exactly. After a tool result, base the next step on that result; if it is an error, correct the call instead of assuming success.");
 
 	return lines.join("\n");

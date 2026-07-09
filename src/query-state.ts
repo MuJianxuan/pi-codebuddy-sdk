@@ -25,6 +25,17 @@ export class QueryContext {
 	nextHandlerIdx = 0;
 	deferredUserMessages: string[] = [];
 
+	// Tool-call blocks whose stream args came through empty (parallel tool_call
+	// dispatch dropping args to {}). Their toolcall_end is deferred until either
+	// the assistant message arrives with complete args, or the MCP handler
+	// receives non-empty dispatch args. The done event is also deferred while
+	// this list is non-empty, so pi does not execute tools with empty args.
+	argsPendingBlocks: Array<{ block: any; contentIndex: number }> = [];
+	// Set when message_stop arrived but done was deferred due to pending blocks.
+	// Prevents double-deferral and lets the assistant-message path know it
+	// must emit the done event after backfilling.
+	doneDeferredForArgs = false;
+
 	// Per-turn (reset together)
 	turnOutput: AssistantMessage | null = null;
 	turnStarted = false;
@@ -47,6 +58,8 @@ export class QueryContext {
 		this.turnStarted = false;
 		this.turnSawStreamEvent = false;
 		this.turnSawToolCall = false;
+		this.argsPendingBlocks = [];
+		this.doneDeferredForArgs = false;
 		// turnToolCallIds and nextHandlerIdx are NOT reset — they persist across
 		// tool-result delivery callbacks within the same assistant message.
 	}

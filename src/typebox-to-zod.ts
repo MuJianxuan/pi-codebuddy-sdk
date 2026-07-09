@@ -163,3 +163,38 @@ export function jsonSchemaToZodShape(schema: unknown, relax = false): Record<str
 export function jsonSchemaToZodObject(schema: unknown, relax = false): z.ZodTypeAny {
 	return jsonSchemaPropertyToZod(schema as JsonSchema, relax);
 }
+
+/**
+ * MCP-specific schema builder: preserves required field constraints so that
+ * an empty {} (from a buggy parallel tool_call dispatch) is rejected by MCP
+ * validation, while still allowing extra keys (passthrough) for forward-compat.
+ *
+ * Unlike jsonSchemaToZodObject(relax=true) which makes ALL params optional,
+ * this keeps required params required. This forces CodeBuddy to regenerate
+ * proper args instead of silently passing {} through to the handler.
+ *
+ * The deferred-backfill logic in processStreamEvent/processAssistantMessage
+ * handles the case where stream args arrive empty — it waits for the
+ * assistant message or MCP dispatch to provide real args. So MCP validation
+ * rejecting {} is safe and desirable: it's an early signal that args were
+ * dropped, rather than letting an empty-args call reach pi.
+ */
+export function jsonSchemaToZodObjectForMcp(schema: unknown): z.ZodTypeAny {
+	const s = schema as JsonSchema;
+	// Build shape with relax=false to preserve required constraints
+	const shape = jsonSchemaToZodShape(s, false);
+	const additionalPropertiesSchema =
+		s?.additionalProperties && typeof s.additionalProperties === "object"
+			? jsonSchemaPropertyToZod(s.additionalProperties as JsonSchema, false)
+			: undefined;
+
+	if (Object.keys(shape).length > 0) {
+		const base = z.object(shape);
+		// Always passthrough: accept extra keys (forward-compat with new params)
+		// but enforce required fields.
+		if (additionalPropertiesSchema) return base.catchall(additionalPropertiesSchema);
+		return base.passthrough();
+	}
+	if (s?.additionalProperties === false) return z.object({}).strict();
+	return z.record(z.string(), z.unknown());
+}

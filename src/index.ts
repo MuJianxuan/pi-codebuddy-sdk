@@ -15,7 +15,7 @@ import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
 import { QueryContext, ctx } from "./query-state.js";
 import { loadConfig, type Config } from "./config.js";
-import { jsonSchemaToZodObject } from "./typebox-to-zod.js";
+import { jsonSchemaToZodObjectForMcp } from "./typebox-to-zod.js";
 import { buildActionSummary, type ToolCallState } from "./askcodebuddy-ui.js";
 import {
 	applyContextWindowCalibrations,
@@ -664,6 +664,7 @@ export const __test = {
 	buildProviderBoundaryOptions,
 	buildProviderQueryOptions,
 	syncSharedSession,
+	isEmptyArgs,
 };
 
 function createDelegationSessionFromContext(
@@ -755,6 +756,20 @@ function mapToolName(name: string, customToolNameToPi?: Map<string, string>): st
 	return name;
 }
 
+// True when a tool-call argument object is empty or absent. Used to detect
+// the parallel-tool-call arg-dropping failure: CodeBuddy's MCP client may
+// dispatch tool_call arguments as {} (especially in parallel batches), and
+// the stream's input_json_delta may also arrive empty. We defer toolcall_end
+// for such blocks until the assistant message (or MCP dispatch) provides
+// real arguments, preventing pi from executing tools with empty args.
+function isEmptyArgs(args: Record<string, unknown> | undefined | null): boolean {
+	if (!args) return true;
+	if (Object.keys(args).length === 0) return true;
+	// Treat an object with only undefined/null values as empty
+	const hasValue = Object.values(args).some((v) => v !== undefined && v !== null);
+	return !hasValue;
+}
+
 // Renames for CodeBuddy SDK param names that differ from pi's native names.
 // Keys not listed here pass through unchanged, so new pi params work automatically.
 const SDK_KEY_RENAMES: Record<string, Record<string, string>> = {
@@ -842,14 +857,51 @@ function buildMcpServers(tools: Tool[], queryCtx: QueryContext): Record<string, 
 	const mcpTools = tools.map((tool) => ({
 		name: tool.name,
 		description: tool.description,
-		// relax=true: make all params optional so a CodeBuddy MCP client that drops
-		// parallel tool_call arguments to {} still passes schema validation. The
-		// handler ignores dispatch args anyway — pi executes using the original
-		// args from the model's stream (event.content_block.input).
-		inputSchema: jsonSchemaToZodObject(tool.parameters, true),
-		handler: async () => {
+		// MCP schema preserves required constraints so empty {} (from parallel
+		// tool_call arg-dropping) is rejected at MCP validation time — an early
+		// signal that args were lost. The deferred-backfill logic handles the
+		// stream side; this handles the dispatch side. Passthrough allows extra
+		// keys for forward-compat.
+		inputSchema: jsonSchemaToZodObjectForMcp(tool.parameters),
+		handler: async (dispatchArgs?: Record<string, unknown>) => {
 			const toolCallId = queryCtx.turnToolCallIds[queryCtx.nextHandlerIdx++];
 			if (!toolCallId) debug(`WARNING: mcp handler ${tool.name} has no toolCallId (idx=${queryCtx.nextHandlerIdx - 1}, available=${queryCtx.turnToolCallIds.length})`);
+
+			debug(`mcp dispatch: ${tool.name} dispatchArgsLen=${JSON.stringify(dispatchArgs ?? {}).length} dispatchArgsEmpty=${isEmptyArgs(dispatchArgs)} idx=${queryCtx.nextHandlerIdx - 1} turnIds=${queryCtx.turnToolCallIds.length} pendingBlocks=${queryCtx.argsPendingBlocks.length}`);
+
+			// Backfill path: if there are args-pending blocks whose toolcall_end
+			// was deferred (stream args were empty), try to backfill using the
+			// MCP dispatch args. This handles the case where the assistant message
+			// also had empty args but the MCP dispatch carries the real args.
+			if (queryCtx.argsPendingBlocks.length > 0 && toolCallId) {
+				const pendingIdx = queryCtx.argsPendingBlocks.findIndex((p) => p.block.id === toolCallId);
+				if (pendingIdx >= 0) {
+					const pending = queryCtx.argsPendingBlocks[pendingIdx];
+					const backfillArgs = mapToolArgs(tool.name, dispatchArgs);
+					if (!isEmptyArgs(backfillArgs)) {
+						pending.block.arguments = backfillArgs;
+						debug(`mcp handler: backfilled ${tool.name} [${toolCallId}] from MCP dispatch args (argsLen=${JSON.stringify(backfillArgs).length})`);
+					} else {
+						debug(`mcp handler: dispatch args also empty for ${tool.name} [${toolCallId}], emitting with current args`);
+					}
+					queryCtx.turnSawToolCall = true;
+					queryCtx.currentPiStream?.push({ type: "toolcall_end", contentIndex: pending.contentIndex, toolCall: pending.block, partial: queryCtx.turnOutput });
+					queryCtx.argsPendingBlocks.splice(pendingIdx, 1);
+
+					// If all pending blocks are now resolved and done was deferred, emit it
+					if (queryCtx.argsPendingBlocks.length === 0 && queryCtx.doneDeferredForArgs && queryCtx.currentPiStream && queryCtx.turnOutput) {
+						queryCtx.doneDeferredForArgs = false;
+						queryCtx.turnOutput.stopReason = "toolUse";
+						const stream = queryCtx.currentPiStream;
+						stream.push({ type: "done", reason: "toolUse", message: queryCtx.turnOutput });
+						markStreamComplete(stream);
+						stream.end();
+						queryCtx.currentPiStream = null;
+						debug(`mcp handler: all pending blocks resolved, emitted deferred done event`);
+					}
+				}
+			}
+
 			if (toolCallId && queryCtx.pendingResults.has(toolCallId)) {
 				const result = queryCtx.pendingResults.get(toolCallId)!;
 				queryCtx.pendingResults.delete(toolCallId);
@@ -995,6 +1047,20 @@ function finalizeCurrentStream(c: QueryContext, stopReason?: string): void {
 	if (!c.turnStarted) ensureTurnStarted(c);
 	const reason = stopReason === "length" ? "length" : "stop";
 	const stream = c.currentPiStream;
+
+	// Drain any args-pending blocks: if the SDK ended abnormally (crash, network
+	// error) without yielding an assistant message, these blocks were never
+	// backfilled. Emit them with their current (possibly empty) args so pi can
+	// surface validation errors rather than silently dropping the tool calls.
+	if (c.argsPendingBlocks.length > 0) {
+		debug(`finalizeCurrentStream: draining ${c.argsPendingBlocks.length} pending block(s) with current args`);
+		for (const pending of c.argsPendingBlocks) {
+			c.turnSawToolCall = true;
+			stream!.push({ type: "toolcall_end", contentIndex: pending.contentIndex, toolCall: pending.block, partial: c.turnOutput });
+		}
+		c.argsPendingBlocks = [];
+		c.doneDeferredForArgs = false;
+	}
 	stream!.push({ type: "done", reason, message: c.turnOutput });
 	markStreamComplete(stream);
 	stream!.end();
@@ -1029,7 +1095,7 @@ function processStreamEvent(
 			c.turnBlocks.push({ type: "thinking", thinking: "", thinkingSignature: "", index: event.index });
 			c.currentPiStream!.push({ type: "thinking_start", contentIndex: c.turnBlocks.length - 1, partial: c.turnOutput });
 		} else if (event.content_block?.type === "tool_use") {
-			c.turnSawToolCall = true;
+			c.turnToolCallIds.push(event.content_block.id);
 			c.turnToolCallIds.push(event.content_block.id);
 			c.turnBlocks.push({
 				type: "toolCall", id: event.content_block.id,
@@ -1076,12 +1142,33 @@ function processStreamEvent(
 		} else if (block.type === "thinking") {
 			c.currentPiStream!.push({ type: "thinking_end", contentIndex: index, content: block.thinking, partial: c.turnOutput });
 		} else if (block.type === "toolCall") {
-			c.turnSawToolCall = true;
+			const partialJsonLen = block.partialJson?.length ?? 0;
 			block.arguments = mapToolArgs(
 				block.name, parsePartialJson(block.partialJson, block.arguments),
 			);
 			delete block.partialJson;
-			c.currentPiStream!.push({ type: "toolcall_end", contentIndex: index, toolCall: block, partial: c.turnOutput });
+
+			debug(`processStreamEvent: content_block_stop ${block.name} [${block.id}] argsSource=${
+				isEmptyArgs(block.arguments) ? "EMPTY" : "stream"
+			} argsLen=${JSON.stringify(block.arguments).length} partialJsonLen=${partialJsonLen}`);
+
+			// Parallel tool-call arg-dropping defense: when the stream delivers
+			// empty args (CodeBuddy's MCP client may dispatch parallel tool_call
+			// arguments as {}), defer toolcall_end until the assistant message
+			// (or MCP dispatch) provides real args. This prevents pi from
+			// executing tools with empty args (e.g. "bash" with no command).
+			//
+			// turnSawToolCall is set only when we actually emit a toolcall_end
+			// (here for non-empty args, or in the backfill path for deferred
+			// blocks). This ensures message_stop's done-deferral check fires
+			// correctly even when ALL tool blocks had empty args.
+			if (isEmptyArgs(block.arguments)) {
+				debug(`processStreamEvent: deferring toolcall_end for ${block.name} [${block.id}] — stream args empty, will backfill from assistant message or MCP dispatch`);
+				c.argsPendingBlocks.push({ block, contentIndex: index });
+			} else {
+				c.turnSawToolCall = true;
+				c.currentPiStream!.push({ type: "toolcall_end", contentIndex: index, toolCall: block, partial: c.turnOutput });
+			}
 		}
 		return;
 	}
@@ -1089,6 +1176,19 @@ function processStreamEvent(
 	if (event?.type === "message_delta") {
 		c.turnOutput.stopReason = mapStopReason(event.delta?.stop_reason);
 		if (event.usage) updateUsage(c.turnOutput, event.usage, model);
+		return;
+	}
+
+	// Check args-pending blocks FIRST, before the turnSawToolCall gate.
+	// turnSawToolCall is only set when a toolcall_end is actually emitted (non-empty
+	// args in content_block_stop, or during backfill). When ALL tool blocks had
+	// empty stream args, turnSawToolCall is false here. Without this early check,
+	// doneDeferredForArgs would never be set and the stream would hang forever.
+	// This is defense-in-depth: the backfill path also handles this, but setting
+	// doneDeferredForArgs here ensures the assistant message path knows to emit done.
+	if (event?.type === "message_stop" && c.argsPendingBlocks.length > 0) {
+		debug(`processStreamEvent: message_stop deferring done event — ${c.argsPendingBlocks.length} block(s) awaiting args backfill (turnSawToolCall=${c.turnSawToolCall})`);
+		c.doneDeferredForArgs = true;
 		return;
 	}
 
@@ -1121,9 +1221,74 @@ function processStreamEvent(
 // the same stream lifecycle as processStreamEvent — including ending the stream on
 // tool_use to prevent deadlock with the MCP handler.
 function processAssistantMessage(message: CbMessage, model: Model<any>, customToolNameToPi: Map<string, string>, c: QueryContext): void {
-	if (c.turnSawStreamEvent) return;
 	const assistantMsg = (message as any).message;
 	if (!assistantMsg?.content) return;
+
+	// --- Args-backfill path (stream already delivered content, but some tool
+	// blocks had empty args). Use the assistant message's complete tool_use
+	// input to backfill the deferred blocks, then emit the pending toolcall_end
+	// events and the deferred done event.
+	if (c.turnSawStreamEvent && c.argsPendingBlocks.length > 0) {
+		debug(`processAssistantMessage: backfill path — ${c.argsPendingBlocks.length} pending block(s), assistant has ${assistantMsg.content.length} blocks`);
+		const toolUseBlocks = assistantMsg.content.filter((b: any) => b.type === "tool_use");
+
+		// Match pending blocks to assistant message tool_use blocks by position.
+		// Stream order and assistant message order should align (both follow the
+	// model's content_block index). If names mismatch we log a warning but still
+	// backfill by position — the stream is the source of truth for ids.
+		const remaining = [...c.argsPendingBlocks];
+		for (const tuBlock of toolUseBlocks) {
+			if (remaining.length === 0) break;
+			const tuName = mapToolName(tuBlock.name, customToolNameToPi);
+			// Find the first pending block whose name matches (or just the first
+		// pending block if names don't match — positional fallback).
+			let matchIdx = remaining.findIndex((p) => p.block.name === tuName);
+			if (matchIdx < 0) {
+				debug(`processAssistantMessage: backfill name mismatch — assistant '${tuName}' vs pending [${remaining.map((p) => p.block.name).join(",")}], using positional fallback`);
+				matchIdx = 0;
+			}
+			const pending = remaining.splice(matchIdx, 1)[0];
+			const dispatchArgs = mapToolArgs(pending.block.name, tuBlock.input);
+			if (isEmptyArgs(dispatchArgs)) {
+				debug(`processAssistantMessage: backfill for ${pending.block.name} [${pending.block.id}] — assistant args also empty, emitting with empty args (pi will validate)`);
+			} else {
+				debug(`processAssistantMessage: backfilled ${pending.block.name} [${pending.block.id}] from assistant message (argsLen=${JSON.stringify(dispatchArgs).length})`);
+			}
+			pending.block.arguments = dispatchArgs;
+			c.turnSawToolCall = true;
+			c.currentPiStream?.push({ type: "toolcall_end", contentIndex: pending.contentIndex, toolCall: pending.block, partial: c.turnOutput });
+			// Remove from the original argsPendingBlocks array
+			const origIdx = c.argsPendingBlocks.indexOf(pending);
+			if (origIdx >= 0) c.argsPendingBlocks.splice(origIdx, 1);
+		}
+
+		// Any remaining pending blocks (no matching assistant tool_use) get
+		// emitted with their (empty) args so pi can surface the validation error
+		// rather than hanging forever.
+		for (const pending of remaining) {
+			debug(`processAssistantMessage: backfill — no matching assistant tool_use for ${pending.block.name} [${pending.block.id}], emitting with current args`);
+			c.turnSawToolCall = true;
+			c.currentPiStream?.push({ type: "toolcall_end", contentIndex: pending.contentIndex, toolCall: pending.block, partial: c.turnOutput });
+			const origIdx = c.argsPendingBlocks.indexOf(pending);
+			if (origIdx >= 0) c.argsPendingBlocks.splice(origIdx, 1);
+		}
+
+		// Emit the deferred done event (message_stop skipped it because of pending blocks)
+		if (c.doneDeferredForArgs && c.turnSawToolCall && c.currentPiStream && c.turnOutput) {
+			c.doneDeferredForArgs = false;
+			c.turnOutput.stopReason = "toolUse";
+			const stream = c.currentPiStream;
+			stream.push({ type: "done", reason: "toolUse", message: c.turnOutput });
+			markStreamComplete(stream);
+			stream.end();
+			c.currentPiStream = null;
+			debug(`processAssistantMessage: backfill complete, emitted deferred done event`);
+		}
+		return;
+	}
+
+	// --- Original path: no stream events, this is the primary content path ---
+	if (c.turnSawStreamEvent) return;
 	c.turnToolCallIds = [];
 	c.nextHandlerIdx = 0;
 	debug(`processAssistantMessage fallback: ${assistantMsg.content.length} blocks, types=${assistantMsg.content.map((b: any) => b.type).join(",")}`);

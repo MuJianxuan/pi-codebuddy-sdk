@@ -42,6 +42,23 @@ describe("buildCodebuddySystemPrompt", () => {
 		assert.ok(!result?.includes("mcp__custom_tools__write"));
 	});
 
+	it("includes parallel tool-call guidance when multiple tools available", () => {
+		const result = buildCodebuddySystemPrompt(PI_PROMPT, {
+			includeAgents: false,
+			availableToolNames: ["read", "bash"],
+		});
+		assert.ok(result?.includes("multiple tools in a single response"));
+		assert.ok(result?.includes("complete arguments"));
+	});
+
+	it("does not include parallel tool-call guidance when only one tool available", () => {
+		const result = buildCodebuddySystemPrompt(PI_PROMPT, {
+			includeAgents: false,
+			availableToolNames: ["read"],
+		});
+		assert.ok(!result?.includes("multiple tools in a single response"));
+	});
+
 	it("does not inject provider tool guidance when disabled", () => {
 		const result = buildCodebuddySystemPrompt(PI_PROMPT, {
 			includeAgents: false,
