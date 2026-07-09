@@ -12,8 +12,8 @@ export type PiModel = {
 	cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
 };
 
-const CONSERVATIVE_DEFAULT_CONTEXT = 65_536;
-const CONSERVATIVE_GEMINI_CONTEXT = 131_072;
+const CONSERVATIVE_DEFAULT_CONTEXT = 200_000;
+const CONSERVATIVE_GEMINI_CONTEXT = 1_048_576;
 const DEFAULT_MAX_TOKENS = 8192;
 
 function detectThinking(id: string): boolean {

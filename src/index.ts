@@ -899,7 +899,7 @@ function observeServedContextWindow(label: string, servedModel: string, observed
 	if (!Number.isFinite(observed) || observed <= 0) return;
 	try {
 		const previousRegistered = MODELS.find((candidate) => candidate.id === model.id)?.contextWindow;
-		const { changed, floorChanged, record } = recordObservedContextWindow(
+		const { changed, record } = recordObservedContextWindow(
 			calibrationCache,
 			model.id,
 			calibrationEnvironment,
@@ -907,11 +907,11 @@ function observeServedContextWindow(label: string, servedModel: string, observed
 		);
 		if (!changed) return;
 		saveCalibrationCache(calibrationCache);
-		const floor = record.capabilities.contextWindow?.floor;
-		if (floor != null) {
+		const latest = record.capabilities.contextWindow?.latest;
+		if (latest != null) {
 			MODELS = MODELS.map((candidate) => (
 				candidate.id === model.id
-					? { ...candidate, contextWindow: floor }
+					? { ...candidate, contextWindow: latest }
 					: candidate
 			));
 		}
@@ -919,7 +919,7 @@ function observeServedContextWindow(label: string, servedModel: string, observed
 			`calibration: ${label} observed=${observed} floor=${record.capabilities.contextWindow?.floor ?? "?"} ` +
 			`latest=${record.capabilities.contextWindow?.latest ?? "?"} servedModel=${servedModel} registeredBefore=${previousRegistered ?? "?"}`,
 		);
-		if (floorChanged && floor != null && previousRegistered != null && floor !== previousRegistered) {
+		if (latest != null && previousRegistered != null && latest !== previousRegistered) {
 			scheduleCalibrationRefresh(`contextWindow:${model.id}`);
 		}
 	} catch (err) {

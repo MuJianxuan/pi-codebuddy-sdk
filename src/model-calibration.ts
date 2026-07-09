@@ -90,8 +90,8 @@ export function applyContextWindowCalibrations<T extends { id: string; contextWi
 ): T[] {
 	return models.map((model) => {
 		const metric = getContextWindowCalibration(cache, model.id, environment);
-		if (!metric?.floor) return model;
-		return { ...model, contextWindow: metric.floor };
+		if (!metric?.latest) return model;
+			return { ...model, contextWindow: metric.latest };
 	});
 }
 
