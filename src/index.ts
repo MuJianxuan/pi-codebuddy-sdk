@@ -667,6 +667,7 @@ export const __test = {
 	isEmptyArgs,
 	hasRequiredParams,
 	claimSerialToolUse,
+	interruptLiveQuery,
 	processStreamEvent,
 };
 
@@ -789,6 +790,10 @@ function claimSerialToolUse(queryCtx: QueryContext, toolUseId: string): boolean 
 		return true;
 	}
 	return queryCtx.claimedToolUseId === toolUseId;
+}
+
+function interruptLiveQuery(ref: { current?: { interrupt?: () => Promise<void> | void } }): void {
+	void ref.current?.interrupt?.();
 }
 
 // Renames for CodeBuddy SDK param names that differ from pi's native names.
@@ -1637,20 +1642,20 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 	const piTools = context.tools ?? [];
 	(queryOptions as SdkQueryOptions).canUseTool = async (toolName: string, input: Record<string, unknown>, opts) => {
 		const piName = mapToolName(toolName, customToolNameToPi);
-		if (!claimSerialToolUse(queryCtx, opts.toolUseID)) {
-			debug(`canUseTool: rejecting ${toolName}→${piName} — serial mode already claimed by ${queryCtx.claimedToolUseId} (toolUseId=${opts.toolUseID})`);
-			return {
-				behavior: "deny" as const,
-				message: `Only one tool call is allowed per assistant turn. Wait for the current tool result before calling another tool in a later turn.`,
-				toolUseID: opts.toolUseID,
-			};
-		}
 		const mappedArgs = mapToolArgs(piName, input);
 		if (isEmptyArgs(mappedArgs) && hasRequiredParams(piName, piTools)) {
 			debug(`canUseTool: rejecting ${toolName}→${piName} — empty args for tool with required params (toolUseId=${opts.toolUseID})`);
 			return {
 				behavior: "deny" as const,
 				message: `Tool "${piName}" requires arguments but received empty input. This can happen with parallel tool calls. Please provide complete arguments for all required fields.`,
+				toolUseID: opts.toolUseID,
+			};
+		}
+		if (!claimSerialToolUse(queryCtx, opts.toolUseID)) {
+			debug(`canUseTool: rejecting ${toolName}→${piName} — serial mode already claimed by ${queryCtx.claimedToolUseId} (toolUseId=${opts.toolUseID})`);
+			return {
+				behavior: "deny" as const,
+				message: `Only one tool call is allowed per assistant turn. Wait for the current tool result before calling another tool in a later turn.`,
 				toolUseID: opts.toolUseID,
 			};
 		}
@@ -1666,10 +1671,11 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 	// 3. Start SDK query (wait for model discovery + serialize SDK subprocess access)
 	let wasAborted = false;
 	let sdkQuery: ReturnType<typeof query> | undefined;
+	const liveQueryRef: { current?: ReturnType<typeof query> } = {};
 	const abortCtx = queryCtx;
 
 	const requestAbort = () => {
-		void sdkQuery?.interrupt().catch(() => {});
+		interruptLiveQuery(liveQueryRef);
 	};
 	const onAbort = () => {
 		wasAborted = true;
@@ -1684,11 +1690,12 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 		else options.signal.addEventListener("abort", onAbort, { once: true });
 	}
 
-	void (async () => {
-		await ensureModelsDiscovered();
-		sdkQuery = query({ prompt, options: queryOptions });
-		queryCtx.activeQuery = sdkQuery;
-		activeQueryContexts.add(queryCtx);
+		void (async () => {
+			await ensureModelsDiscovered();
+			sdkQuery = query({ prompt, options: queryOptions });
+			liveQueryRef.current = sdkQuery;
+			queryCtx.activeQuery = sdkQuery;
+			activeQueryContexts.add(queryCtx);
 
 		try {
 			const { capturedSessionId } = await consumeQuery(sdkQuery, customToolNameToPi, model, () => wasAborted, queryCtx);
@@ -1734,10 +1741,11 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 					break;
 				}
 
-				const contOptions = { ...queryOptions, resume: resumeId, ...makeCliDebugOptions("continuation") };
-				const contQuery = query({ prompt: steerPrompt, options: contOptions });
-				queryCtx.activeQuery = contQuery;
-				debug(`provider: continuation query, model=${cliModel}, resume=${resumeId.slice(0, 8)}, promptLen=${steerPrompt.length}`);
+					const contOptions = { ...queryOptions, resume: resumeId, ...makeCliDebugOptions("continuation") };
+					const contQuery = query({ prompt: steerPrompt, options: contOptions });
+					liveQueryRef.current = contQuery;
+					queryCtx.activeQuery = contQuery;
+					debug(`provider: continuation query, model=${cliModel}, resume=${resumeId.slice(0, 8)}, promptLen=${steerPrompt.length}`);
 
 				try {
 					const { capturedSessionId: contSid } = await consumeQuery(contQuery, customToolNameToPi, model, () => wasAborted, queryCtx);
@@ -1783,6 +1791,7 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 			queryCtx.currentPiStream = null;
 		} finally {
 			if (options?.signal) options.signal.removeEventListener("abort", onAbort);
+			liveQueryRef.current = undefined;
 			if (queryCtx.activeQuery === sdkQuery) {
 				for (const pending of queryCtx.pendingToolCalls.values()) { pending.resolve({ content: [{ type: "text", text: "Query ended" }] }); }
 				queryCtx.pendingToolCalls.clear();

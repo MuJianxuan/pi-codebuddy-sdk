@@ -16,7 +16,7 @@ import assert from "node:assert/strict";
 import { ctx, resetStack } from "../src/query-state.js";
 import { __test } from "../src/index.js";
 
-const { claimSerialToolUse, isEmptyArgs, processStreamEvent } = __test;
+const { claimSerialToolUse, interruptLiveQuery, isEmptyArgs, processStreamEvent } = __test;
 
 const fakeModel = { api: "anthropic", provider: "anthropic", id: "test-model" };
 
@@ -571,6 +571,7 @@ describe("canUseTool pre-validation logic", () => {
 
 describe("serial tool-call gate", () => {
 	beforeEach(() => resetStack());
+	const { hasRequiredParams } = __test;
 
 	it("claims the first toolUseID in a turn", () => {
 		ctx().resetTurnState(fakeModel);
@@ -600,5 +601,57 @@ describe("serial tool-call gate", () => {
 		assert.strictEqual(ctx().claimedToolUseId, null);
 		assert.strictEqual(claimSerialToolUse(ctx(), "toolu_2"), true);
 		assert.strictEqual(ctx().claimedToolUseId, "toolu_2");
+	});
+
+	it("does not consume the serial slot when the first tool is denied for empty args", () => {
+		ctx().resetTurnState(fakeModel);
+		const tools = [{ name: "read", parameters: { type: "object", required: ["path"] } }];
+
+		function canUseToolDecisionWithSerial(c, toolName, input, toolUseId) {
+			const mappedArgs = input;
+			if (isEmptyArgs(mappedArgs) && hasRequiredParams(toolName, tools)) {
+				return { behavior: "deny", reason: "empty-args" };
+			}
+			if (!claimSerialToolUse(c, toolUseId)) {
+				return { behavior: "deny", reason: "serial-gate" };
+			}
+			return { behavior: "allow" };
+		}
+
+		const first = canUseToolDecisionWithSerial(ctx(), "read", {}, "toolu_bad");
+		assert.strictEqual(first.behavior, "deny");
+		assert.strictEqual(first.reason, "empty-args");
+		assert.strictEqual(ctx().claimedToolUseId, null);
+
+		const retry = canUseToolDecisionWithSerial(ctx(), "read", { path: "/tmp/file.txt" }, "toolu_retry");
+		assert.strictEqual(retry.behavior, "allow");
+		assert.strictEqual(ctx().claimedToolUseId, "toolu_retry");
+	});
+});
+
+describe("live query abort targeting", () => {
+	it("interrupts whichever query is currently live", async () => {
+		const calls = [];
+		const primary = {
+			interrupt: async () => { calls.push("primary"); },
+		};
+		const continuation = {
+			interrupt: async () => { calls.push("continuation"); },
+		};
+		const ref = { current: primary };
+
+		interruptLiveQuery(ref);
+		await Promise.resolve();
+		assert.deepStrictEqual(calls, ["primary"]);
+
+		ref.current = continuation;
+		interruptLiveQuery(ref);
+		await Promise.resolve();
+		assert.deepStrictEqual(calls, ["primary", "continuation"]);
+
+		ref.current = undefined;
+		interruptLiveQuery(ref);
+		await Promise.resolve();
+		assert.deepStrictEqual(calls, ["primary", "continuation"]);
 	});
 });
