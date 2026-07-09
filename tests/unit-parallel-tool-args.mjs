@@ -330,3 +330,129 @@ describe("parallel tool-call backfill simulation", () => {
 		assert.deepStrictEqual(c.turnBlocks[0].arguments, {});
 	});
 });
+
+// --- toolCallId name-based matching (parallel dispatch order fix) ---
+
+describe("toolCallId name-based matching", () => {
+	beforeEach(() => resetStack());
+
+	it("matchedToolCallIds starts empty and resets with resetTurnState", () => {
+		ctx().resetTurnState(fakeModel);
+		assert.strictEqual(ctx().matchedToolCallIds.size, 0);
+		ctx().matchedToolCallIds.add("t1");
+		ctx().resetTurnState(fakeModel);
+		assert.strictEqual(ctx().matchedToolCallIds.size, 0);
+	});
+
+	it("resolves correct toolCallId when dispatch order matches stream order", () => {
+		ctx().resetTurnState(fakeModel);
+		const c = ctx();
+
+		// Stream order: read (t1), bash (t2)
+		c.turnToolCallIds = ["t1", "t2"];
+		c.turnBlocks.push({ type: "toolCall", id: "t1", name: "read", arguments: { path: "/a" } });
+		c.turnBlocks.push({ type: "toolCall", id: "t2", name: "bash", arguments: { command: "ls" } });
+
+		// Handler for read dispatched first (matches stream order)
+		let id = resolveToolCallIdByName(c, "read");
+		assert.strictEqual(id, "t1");
+		assert.ok(c.matchedToolCallIds.has("t1"));
+
+		// Handler for bash dispatched second
+		id = resolveToolCallIdByName(c, "bash");
+		assert.strictEqual(id, "t2");
+		assert.ok(c.matchedToolCallIds.has("t2"));
+	});
+
+	it("resolves correct toolCallId when dispatch order is REVERSED from stream order", () => {
+		// This is the core bug: CodeBuddy dispatches bash before read,
+		// but stream had read first. Index-based matching would give
+		// bash handler → t1 (read's id) and read handler → t2 (bash's id).
+		// Name-based matching correctly gives bash → t2, read → t1.
+		ctx().resetTurnState(fakeModel);
+		const c = ctx();
+
+		// Stream order: read (t1), bash (t2)
+		c.turnToolCallIds = ["t1", "t2"];
+		c.turnBlocks.push({ type: "toolCall", id: "t1", name: "read", arguments: { path: "/a" } });
+		c.turnBlocks.push({ type: "toolCall", id: "t2", name: "bash", arguments: { command: "ls" } });
+
+		// Handler for bash dispatched FIRST (reversed order)
+		let id = resolveToolCallIdByName(c, "bash");
+		assert.strictEqual(id, "t2", "bash handler should get t2, not t1");
+		assert.ok(c.matchedToolCallIds.has("t2"));
+
+		// Handler for read dispatched second
+		id = resolveToolCallIdByName(c, "read");
+		assert.strictEqual(id, "t1", "read handler should get t1, not t2");
+		assert.ok(c.matchedToolCallIds.has("t1"));
+	});
+
+	it("handles same-name tool calls (two reads) by positional fallback", () => {
+		ctx().resetTurnState(fakeModel);
+		const c = ctx();
+
+		// Two read calls in stream order
+		c.turnToolCallIds = ["t1", "t2"];
+		c.turnBlocks.push({ type: "toolCall", id: "t1", name: "read", arguments: { path: "/a" } });
+		c.turnBlocks.push({ type: "toolCall", id: "t2", name: "read", arguments: { path: "/b" } });
+
+		// First read handler → t1
+		let id = resolveToolCallIdByName(c, "read");
+		assert.strictEqual(id, "t1");
+
+		// Second read handler → t2
+		id = resolveToolCallIdByName(c, "read");
+		assert.strictEqual(id, "t2");
+	});
+
+	it("does not re-assign an already-matched toolCallId", () => {
+		ctx().resetTurnState(fakeModel);
+		const c = ctx();
+
+		c.turnToolCallIds = ["t1", "t2"];
+		c.turnBlocks.push({ type: "toolCall", id: "t1", name: "read", arguments: {} });
+		c.turnBlocks.push({ type: "toolCall", id: "t2", name: "read", arguments: {} });
+
+		// First call claims t1
+		const id1 = resolveToolCallIdByName(c, "read");
+		assert.strictEqual(id1, "t1");
+
+		// Second call should NOT get t1 again
+		const id2 = resolveToolCallIdByName(c, "read");
+		assert.strictEqual(id2, "t2");
+		assert.notStrictEqual(id1, id2);
+	});
+
+	it("returns undefined when all toolCallIds are matched", () => {
+		ctx().resetTurnState(fakeModel);
+		const c = ctx();
+
+		c.turnToolCallIds = ["t1"];
+		c.turnBlocks.push({ type: "toolCall", id: "t1", name: "read", arguments: {} });
+
+		const id1 = resolveToolCallIdByName(c, "read");
+		assert.strictEqual(id1, "t1");
+
+		// No more unmatched ids
+		const id2 = resolveToolCallIdByName(c, "read");
+		assert.strictEqual(id2, undefined);
+	});
+});
+
+/**
+ * Simulates the name-based toolCallId matching logic from buildMcpServers.
+ * Extracted as a helper so tests can exercise the matching without activating
+ * the full MCP server.
+ */
+function resolveToolCallIdByName(c, toolName) {
+	for (const id of c.turnToolCallIds) {
+		if (c.matchedToolCallIds.has(id)) continue;
+		const block = c.turnBlocks.find((b) => b.id === id && b.type === "toolCall");
+		if (block && block.name === toolName) {
+			c.matchedToolCallIds.add(id);
+			return id;
+		}
+	}
+	return undefined;
+}

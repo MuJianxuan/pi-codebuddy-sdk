@@ -864,10 +864,38 @@ function buildMcpServers(tools: Tool[], queryCtx: QueryContext): Record<string, 
 		// keys for forward-compat.
 		inputSchema: jsonSchemaToZodObjectForMcp(tool.parameters),
 		handler: async (dispatchArgs?: Record<string, unknown>) => {
-			const toolCallId = queryCtx.turnToolCallIds[queryCtx.nextHandlerIdx++];
-			if (!toolCallId) debug(`WARNING: mcp handler ${tool.name} has no toolCallId (idx=${queryCtx.nextHandlerIdx - 1}, available=${queryCtx.turnToolCallIds.length})`);
+			// Name-based toolCallId matching: find the first toolCallId whose
+			// corresponding turnBlock has a name matching this tool, and hasn't
+			// been claimed by a previous handler invocation. This fixes the
+			// parallel-dispatch race where CodeBuddy calls MCP handlers in a
+			// different order than the stream's content_block_start events —
+			// without this, bash's handler could get read's toolCallId, causing
+			// result misassignment (bash result → read handler, vice versa).
+			//
+			// Fallback to index-based for robustness (e.g. if turnBlocks doesn't
+			// have the block yet, or same-name dedup edge cases).
+			let toolCallId: string | undefined;
+			for (const id of queryCtx.turnToolCallIds) {
+				if (queryCtx.matchedToolCallIds.has(id)) continue;
+				const block = queryCtx.turnBlocks.find((b: any) => b.id === id && b.type === "toolCall");
+				if (block && block.name === tool.name) {
+					toolCallId = id;
+					queryCtx.matchedToolCallIds.add(id);
+					break;
+				}
+			}
+			// Fallback: if no name match, use index (handles edge cases where
+			// block.name hasn't been mapped yet or same-name calls overflow)
+			if (!toolCallId) {
+				toolCallId = queryCtx.turnToolCallIds[queryCtx.nextHandlerIdx];
+				if (toolCallId) {
+					queryCtx.matchedToolCallIds.add(toolCallId);
+					queryCtx.nextHandlerIdx++;
+				}
+			}
+			if (!toolCallId) debug(`WARNING: mcp handler ${tool.name} has no toolCallId (matched=${queryCtx.matchedToolCallIds.size}, available=${queryCtx.turnToolCallIds.length})`);
 
-			debug(`mcp dispatch: ${tool.name} dispatchArgsLen=${JSON.stringify(dispatchArgs ?? {}).length} dispatchArgsEmpty=${isEmptyArgs(dispatchArgs)} idx=${queryCtx.nextHandlerIdx - 1} turnIds=${queryCtx.turnToolCallIds.length} pendingBlocks=${queryCtx.argsPendingBlocks.length}`);
+			debug(`mcp dispatch: ${tool.name} dispatchArgsLen=${JSON.stringify(dispatchArgs ?? {}).length} dispatchArgsEmpty=${isEmptyArgs(dispatchArgs)} matched=${queryCtx.matchedToolCallIds.size}/${queryCtx.turnToolCallIds.length} pendingBlocks=${queryCtx.argsPendingBlocks.length}`);
 
 			// Backfill path: if there are args-pending blocks whose toolcall_end
 			// was deferred (stream args were empty), try to backfill using the
@@ -1081,7 +1109,8 @@ function processStreamEvent(
 
 	if (event?.type === "message_start") {
 		c.turnToolCallIds = [];
-		c.nextHandlerIdx = 0;
+			c.nextHandlerIdx = 0;
+			c.matchedToolCallIds = new Set();
 		if (event.message?.usage) updateUsage(c.turnOutput, event.message.usage, model);
 		return;
 	}
@@ -1290,7 +1319,8 @@ function processAssistantMessage(message: CbMessage, model: Model<any>, customTo
 	// --- Original path: no stream events, this is the primary content path ---
 	if (c.turnSawStreamEvent) return;
 	c.turnToolCallIds = [];
-	c.nextHandlerIdx = 0;
+		c.nextHandlerIdx = 0;
+		c.matchedToolCallIds = new Set();
 	debug(`processAssistantMessage fallback: ${assistantMsg.content.length} blocks, types=${assistantMsg.content.map((b: any) => b.type).join(",")}`);
 	for (const block of assistantMsg.content) {
 		if (block.type === "text" && block.text) {

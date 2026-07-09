@@ -23,6 +23,12 @@ export class QueryContext {
 	pendingResults = new Map<string, McpResult>();
 	turnToolCallIds: string[] = [];
 	nextHandlerIdx = 0;
+	// toolCallIds already assigned to an MCP handler. Used by name-based
+	// matching to avoid the index-order race when CodeBuddy dispatches
+	// parallel tool handlers in a different order than the stream's
+	// content_block_start events. Without this, bash's handler could get
+	// read's toolCallId, causing result misassignment.
+	matchedToolCallIds = new Set<string>();
 	deferredUserMessages: string[] = [];
 
 	// Tool-call blocks whose stream args came through empty (parallel tool_call
@@ -60,6 +66,7 @@ export class QueryContext {
 		this.turnSawToolCall = false;
 		this.argsPendingBlocks = [];
 		this.doneDeferredForArgs = false;
+		this.matchedToolCallIds = new Set();
 		// turnToolCallIds and nextHandlerIdx are NOT reset — they persist across
 		// tool-result delivery callbacks within the same assistant message.
 	}
