@@ -1,5 +1,7 @@
-// Dynamic model list from CodeBuddy SDK supportedModels().
-import type { ModelInfo } from "@tencent-ai/agent-sdk";
+// Dynamic model list from CodeBuddy SDK.
+// - supportedModels(): simplified ModelInfo (no token limits) — legacy fallback.
+// - getAvailableModelsRaw(): RawLanguageModel with real maxInputTokens / maxOutputTokens.
+import type { ModelInfo, RawLanguageModel } from "@tencent-ai/agent-sdk";
 
 export type PiModel = {
 	id: string;
@@ -48,6 +50,29 @@ export function rawModelsFromSdk(supported: Array<ModelInfo & { id?: string; nam
 			maxTokens: conservativeMaxTokens(m.id!),
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		}));
+}
+
+// Build PiModel[] from the SDK Session API's getAvailableModelsRaw() result.
+// Unlike rawModelsFromSdk() (which only gets the simplified ModelInfo and must
+// fall back to conservativeContextWindow), this reads the real per-model token
+// limits (maxInputTokens = context window, maxOutputTokens = max output) plus
+// capability flags (supportsImages / supportsReasoning) directly from the CLI.
+// Models marked disabled are filtered out so Pi never offers an unusable model.
+export function rawModelsFromSdkRaw(raw: RawLanguageModel[]): PiModel[] {
+	return raw
+		.filter((m) => m.id && !m.disabled)
+		.map((m) => {
+			const id = m.id!;
+			return {
+				id,
+				name: m.name || id,
+				reasoning: m.supportsReasoning ?? detectThinking(id),
+				input: (m.supportsImages ?? detectImages(id)) ? ["text", "image"] as const : ["text"] as const,
+				contextWindow: m.maxInputTokens ?? conservativeContextWindow(id),
+				maxTokens: m.maxOutputTokens ?? conservativeMaxTokens(id),
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			};
+		});
 }
 
 export const FALLBACK_MODELS: PiModel[] = [

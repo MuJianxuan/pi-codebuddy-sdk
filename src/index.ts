@@ -1,7 +1,7 @@
 import { calculateCost, StringEnum, type AssistantMessage, type AssistantMessageEventStream, type Context, type Model, type SimpleStreamOptions, type Tool } from "@earendil-works/pi-ai";
 import * as piAi from "@earendil-works/pi-ai";
 import { buildSessionContext, compact, keyHint, type CompactionEntry, type ExtensionAPI, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
-import { createSdkMcpServer, query, type Effort, type Message as CbMessage, type UserMessage as CbUserMessage } from "@tencent-ai/agent-sdk";
+import { createSdkMcpServer, query, unstable_v2_createSession as createSdkSession, type Effort, type Message as CbMessage, type UserMessage as CbUserMessage } from "@tencent-ai/agent-sdk";
 import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
 import { createSession, deleteSession } from "./cb-session-io.js";
@@ -9,7 +9,7 @@ import { appendFileSync, mkdirSync, realpathSync, statSync } from "fs";
 import { homedir } from "os";
 import { dirname, join } from "path";
 import { PROVIDER_ID, messageContentToText, convertPiMessages } from "./convert.js";
-import { buildModels, codebuddyModelId, FALLBACK_MODELS, rawModelsFromSdk, resolveModel as _resolveModel, type PiModel } from "./models.js";
+import { buildModels, codebuddyModelId, FALLBACK_MODELS, rawModelsFromSdk, rawModelsFromSdkRaw, resolveModel as _resolveModel, type PiModel } from "./models.js";
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, buildCodebuddySystemPrompt, enhancePiToolForCodebuddy } from "./skills.js";
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
@@ -842,7 +842,11 @@ function buildMcpServers(tools: Tool[], queryCtx: QueryContext): Record<string, 
 	const mcpTools = tools.map((tool) => ({
 		name: tool.name,
 		description: tool.description,
-		inputSchema: jsonSchemaToZodObject(tool.parameters),
+		// relax=true: make all params optional so a CodeBuddy MCP client that drops
+		// parallel tool_call arguments to {} still passes schema validation. The
+		// handler ignores dispatch args anyway — pi executes using the original
+		// args from the model's stream (event.content_block.input).
+		inputSchema: jsonSchemaToZodObject(tool.parameters, true),
 		handler: async () => {
 			const toolCallId = queryCtx.turnToolCallIds[queryCtx.nextHandlerIdx++];
 			if (!toolCallId) debug(`WARNING: mcp handler ${tool.name} has no toolCallId (idx=${queryCtx.nextHandlerIdx - 1}, available=${queryCtx.turnToolCallIds.length})`);
@@ -1716,18 +1720,51 @@ let discoverInFlight: Promise<void> | null = null;
 
 async function discoverModels(pi: ExtensionAPI): Promise<void> {
 	await withSdkGate(async () => {
+		const codebuddyExecutable = providerSettings.pathToCodebuddyCode;
+		const commonOpts = {
+			maxTurns: 0,
+			permissionMode: "bypassPermissions" as const,
+			tools: [] as string[],
+			cwd: process.cwd(),
+			env: { ...process.env, DISABLE_AUTO_COMPACT: "1" },
+			...(codebuddyExecutable ? { pathToCodebuddyCode: codebuddyExecutable } : {}),
+			...makeCliDebugOptions("discover-models"),
+		};
+
+		// Preferred path: Session API getAvailableModelsRaw() returns RawLanguageModel[]
+		// with the real per-model maxInputTokens (context window) and maxOutputTokens,
+		// plus capability flags (supportsImages / supportsReasoning). This eliminates
+		// first-run Window Drift — Pi registers the true context window up front
+		// instead of the 200K conservative default. Runtime calibration remains as a
+		// downward correction layer for entitlement-limited served windows.
 		try {
-			const codebuddyExecutable = providerSettings.pathToCodebuddyCode;
+			const session = createSdkSession(commonOpts);
+			try {
+				await session.connect();
+				const rawModels = await session.getAvailableModelsRaw();
+				if (rawModels.length) {
+					MODELS = applyModelCalibrations(rawModelsFromSdkRaw(rawModels));
+					registerCurrentProvider(pi);
+					modelsDiscovered = true;
+					debug(`discoverModels: registered ${MODELS.length} models via getAvailableModelsRaw()`);
+					return;
+				}
+				debug("discoverModels: getAvailableModelsRaw() returned empty, falling back to supportedModels()");
+			} finally {
+				session.close();
+			}
+		} catch (err) {
+			debug("discoverModels: getAvailableModelsRaw() failed, falling back to supportedModels()", err);
+		}
+
+		// Fallback path: one-shot query().supportedModels() returns the simplified
+		// ModelInfo (value/displayName/description) without token limits, so we must
+		// use the conservativeContextWindow() heuristic. Used when the CLI doesn't
+		// support the get_available_models control request or the Session API errors.
+		try {
 			const q = query({
 				prompt: " ",
-				options: {
-					maxTurns: 0,
-					permissionMode: "bypassPermissions",
-					tools: [],
-					env: { ...process.env, DISABLE_AUTO_COMPACT: "1" },
-					...(codebuddyExecutable ? { pathToCodebuddyCode: codebuddyExecutable } : {}),
-					...makeCliDebugOptions("supported-models"),
-				},
+				options: commonOpts,
 			});
 			const supported = await q.supportedModels();
 			await q.return().catch(() => {});
@@ -1735,9 +1772,9 @@ async function discoverModels(pi: ExtensionAPI): Promise<void> {
 			MODELS = applyModelCalibrations(rawModelsFromSdk(supported as any));
 			registerCurrentProvider(pi);
 			modelsDiscovered = true;
-			debug(`discoverModels: registered ${MODELS.length} models from SDK`);
+			debug(`discoverModels: registered ${MODELS.length} models from supportedModels()`);
 		} catch (err) {
-			debug("discoverModels: failed, using fallback models", err);
+			debug("discoverModels: supportedModels() failed, using fallback models", err);
 		}
 	});
 }

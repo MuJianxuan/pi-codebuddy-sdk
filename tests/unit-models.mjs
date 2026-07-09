@@ -26,9 +26,9 @@ describe("rawModelsFromSdk", () => {
 
 	describe("conservativeContextWindow", () => {
 		it("uses family-bounded conservative defaults", () => {
-			assert.equal(conservativeContextWindow("gemini-2.5-pro"), 131_072);
-			assert.equal(conservativeContextWindow("claude-sonnet-4.6"), 65_536);
-			assert.equal(conservativeContextWindow("hy3-preview-agent-ioa"), 65_536);
+			assert.equal(conservativeContextWindow("gemini-2.5-pro"), 1_048_576);
+			assert.equal(conservativeContextWindow("claude-sonnet-4.6"), 200_000);
+			assert.equal(conservativeContextWindow("hy3-preview-agent-ioa"), 200_000);
 		});
 	});
 

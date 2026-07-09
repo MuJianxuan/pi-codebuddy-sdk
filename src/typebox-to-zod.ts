@@ -44,24 +44,26 @@ function intersectionSchema(schemas: z.ZodTypeAny[]): z.ZodTypeAny {
 	return schemas.slice(1).reduce((left, right) => z.intersection(left, right), schemas[0]);
 }
 
-function objectSchema(prop: JsonSchema): z.ZodTypeAny {
-	const shape = jsonSchemaToZodShape(prop);
+function objectSchema(prop: JsonSchema, relax = false): z.ZodTypeAny {
+	const shape = jsonSchemaToZodShape(prop, relax);
 	const additionalPropertiesSchema =
 		prop.additionalProperties && typeof prop.additionalProperties === "object"
-			? jsonSchemaPropertyToZod(prop.additionalProperties as JsonSchema)
+			? jsonSchemaPropertyToZod(prop.additionalProperties as JsonSchema, relax)
 			: undefined;
 	if (Object.keys(shape).length > 0) {
 		const base = z.object(shape);
-		if (prop.additionalProperties === false) return base.strict();
+		// relax: never strict — accept {} and extra keys so a CodeBuddy MCP client
+		// that drops parallel tool_call arguments to {} still passes validation.
+		if (!relax && prop.additionalProperties === false) return base.strict();
 		if (additionalPropertiesSchema) return base.catchall(additionalPropertiesSchema);
 		return base.passthrough();
 	}
 	if (additionalPropertiesSchema) return z.record(z.string(), additionalPropertiesSchema);
-	if (prop.additionalProperties === false) return z.object({}).strict();
+	if (!relax && prop.additionalProperties === false) return z.object({}).strict();
 	return z.record(z.string(), z.unknown());
 }
 
-export function jsonSchemaPropertyToZod(prop: JsonSchema): z.ZodTypeAny {
+export function jsonSchemaPropertyToZod(prop: JsonSchema, relax = false): z.ZodTypeAny {
 	let base: z.ZodTypeAny;
 
 	if (prop.const !== undefined) {
@@ -122,7 +124,7 @@ export function jsonSchemaPropertyToZod(prop: JsonSchema): z.ZodTypeAny {
 				: z.array(z.unknown());
 			break;
 		case "object":
-			base = objectSchema(prop);
+			base = objectSchema(prop, relax);
 			break;
 		case "null":
 			base = z.null();
@@ -136,7 +138,7 @@ export function jsonSchemaPropertyToZod(prop: JsonSchema): z.ZodTypeAny {
 	return withDescription(base, prop);
 }
 
-export function jsonSchemaToZodShape(schema: unknown): Record<string, z.ZodTypeAny> {
+export function jsonSchemaToZodShape(schema: unknown, relax = false): Record<string, z.ZodTypeAny> {
 	const s = schema as JsonSchema;
 	const objectSchemas = [s, ...(Array.isArray(s?.allOf) ? s.allOf as JsonSchema[] : [])]
 		.filter((item) => item && typeof item === "object" && ((item as JsonSchema).type === "object" || (item as JsonSchema).properties));
@@ -148,13 +150,16 @@ export function jsonSchemaToZodShape(schema: unknown): Record<string, z.ZodTypeA
 		if (!props) continue;
 		const required = new Set(Array.isArray(objectSchemaPart.required) ? objectSchemaPart.required as string[] : []);
 		for (const [key, prop] of Object.entries(props)) {
-			const zodProp = jsonSchemaPropertyToZod(prop);
-			shape[key] = required.has(key) ? zodProp : zodProp.optional();
+			const zodProp = jsonSchemaPropertyToZod(prop, relax);
+			// relax: make every property optional so an empty {} (args dropped by a
+			// buggy parallel tool_call dispatch) still validates. Descriptions are
+			// preserved so the model keeps parameter guidance.
+			shape[key] = relax || !required.has(key) ? zodProp.optional() : zodProp;
 		}
 	}
 	return shape;
 }
 
-export function jsonSchemaToZodObject(schema: unknown): z.ZodTypeAny {
-	return jsonSchemaPropertyToZod(schema as JsonSchema);
+export function jsonSchemaToZodObject(schema: unknown, relax = false): z.ZodTypeAny {
+	return jsonSchemaPropertyToZod(schema as JsonSchema, relax);
 }
