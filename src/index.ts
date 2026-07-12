@@ -47,6 +47,7 @@ import {
 } from "./askcodebuddy-runner.js";
 import { ToolTurnCoordinator } from "./tool-turn-coordinator.js";
 import { createRuntimeConfigController, type RuntimeConfigSnapshot } from "./runtime-config-controller.js";
+import { canonicalizeProjectCwd } from "./project-config-trust.js";
 import {
 	getGlobalProviderDispatcher,
 	getGlobalRuntimeConfigRegistry,
@@ -73,6 +74,7 @@ const DEBUG = process.env.CODEBUDDY_SDK_DEBUG === "1";
 const DEBUG_LOG_PATH = process.env.CODEBUDDY_SDK_DEBUG_PATH || join(homedir(), ".pi", "agent", "codebuddy-sdk.log");
 const DIAG_LOG_PATH = join(homedir(), ".pi", "agent", "codebuddy-sdk-diag.log");
 const ISSUES_URL = "https://github.com/MuJianxuan/pi-codebuddy-sdk/issues/new";
+const PERMISSION_PENDING_TIMEOUT_MS = 30_000;
 
 function redactForLog(value: string): string {
 	const home = homedir();
@@ -1436,6 +1438,18 @@ function emitAllowedToolBlock(c: QueryContext, block: any, contentIndex: number,
 	block.__piToolcallEndEmitted = true;
 }
 
+function queuePermissionPendingBlock(c: QueryContext, block: any, contentIndex: number): void {
+	if (c.permissionPendingBlocks.some((pending) => pending.block === block || pending.block.id === block.id)) return;
+	const pending: QueryContext["permissionPendingBlocks"][number] = { block, contentIndex };
+	pending.deadlineTimer = setTimeout(() => {
+		if (!c.permissionPendingBlocks.some((entry) => entry === pending)) return;
+		debug(`permission pending timeout: denying ${block.name} [${block.id}] after ${PERMISSION_PENDING_TIMEOUT_MS}ms`);
+		resolvePermissionPendingTool(c, block.id, false);
+	}, PERMISSION_PENDING_TIMEOUT_MS);
+	pending.deadlineTimer.unref?.();
+	c.permissionPendingBlocks.push(pending);
+}
+
 function finishPermissionDeferredTurn(c: QueryContext): void {
 	if (!c.doneDeferredForArgs || c.permissionPendingBlocks.length > 0 || c.argsPendingBlocks.length > 0 || !c.currentPiStream || !c.turnOutput) return;
 	c.doneDeferredForArgs = false;
@@ -1472,32 +1486,40 @@ function expectTrailingAssistant(c: QueryContext): void {
 	]);
 	if (toolCallIds.size === 0) return;
 	c.awaitingTrailingAssistant = {
-		generation: c.sdkTurnGeneration,
 		toolCallIds,
 	};
-	debug(`provider: awaiting trailing assistant generation=${c.sdkTurnGeneration} toolIds=${toolCallIds.size}`);
+	debug(`provider: awaiting trailing assistant toolIds=${toolCallIds.size}`);
 }
 
 function consumeTrailingAssistant(message: CbMessage, c: QueryContext): boolean {
 	const expected = c.awaitingTrailingAssistant;
 	if (!expected) return false;
+	if (Object.prototype.hasOwnProperty.call(message as any, "parent_tool_use_id")) {
+		const parentToolUseId = (message as any).parent_tool_use_id;
+		c.awaitingTrailingAssistant = null;
+		if (typeof parentToolUseId === "string" && expected.toolCallIds.has(parentToolUseId)) {
+			debug(`provider: consumed trailing assistant parentToolUseId=${parentToolUseId}`);
+			return true;
+		}
+		debug(`provider: trailing assistant parent mismatch expectedIds=${expected.toolCallIds.size} actual=${parentToolUseId}; delivering`);
+		return false;
+	}
 	const content = (message as any).message?.content;
 	c.awaitingTrailingAssistant = null;
 	if (!Array.isArray(content)) {
-		debug(`provider: trailing assistant malformed generation=${c.sdkTurnGeneration}; delivering`);
+		debug("provider: trailing assistant malformed; delivering");
 		return false;
 	}
 	const toolCallIds = content
 		.filter((block: any) => block?.type === "tool_use" && typeof block.id === "string")
 		.map((block: any) => block.id as string);
-	const matches = expected.generation === c.sdkTurnGeneration
-		&& toolCallIds.length > 0
+	const matches = toolCallIds.length > 0
 		&& toolCallIds.every((id) => expected.toolCallIds.has(id));
 	if (!matches) {
-		debug(`provider: trailing assistant mismatch generation=${c.sdkTurnGeneration} expectedIds=${expected.toolCallIds.size} actualIds=${toolCallIds.length}; delivering`);
+		debug(`provider: trailing assistant mismatch expectedIds=${expected.toolCallIds.size} actualIds=${toolCallIds.length}; delivering`);
 		return false;
 	}
-	debug(`provider: consumed trailing assistant generation=${c.sdkTurnGeneration} toolIds=${toolCallIds.length}`);
+	debug(`provider: consumed trailing assistant toolIds=${toolCallIds.length}`);
 	return true;
 }
 
@@ -1528,6 +1550,7 @@ function resolvePermissionPendingTool(c: QueryContext, toolUseId: string, allowe
 	let shouldAllow = allowed;
 	if (pendingIndex >= 0) {
 		const pending = c.permissionPendingBlocks.splice(pendingIndex, 1)[0];
+		if (pending.deadlineTimer) clearTimeout(pending.deadlineTimer);
 		if (c.turnCoordinator.snapshot().pendingIds.includes(toolUseId)) {
 			const decision = c.turnCoordinator.recordPermissionDecision(
 				toolUseId,
@@ -1539,6 +1562,7 @@ function resolvePermissionPendingTool(c: QueryContext, toolUseId: string, allowe
 			shouldAllow = allowed && decision.behavior === "allow";
 		}
 		if (shouldAllow) {
+			c.claimedToolUseId ??= toolUseId;
 			const coordinatorArgs = c.turnCoordinator.getArgs(toolUseId);
 			if (!isEmptyArgs(coordinatorArgs)) {
 				pending.block.arguments = mapToolArgs(pending.block.name, {
@@ -1558,6 +1582,7 @@ function resolvePermissionPendingTool(c: QueryContext, toolUseId: string, allowe
 		c.argsPendingBlocks = c.argsPendingBlocks.filter((pending) => pending.block.id !== toolUseId);
 		const idIndex = c.turnToolCallIds.indexOf(toolUseId);
 		if (idIndex >= 0) c.turnToolCallIds.splice(idIndex, 1);
+		if (c.claimedToolUseId === toolUseId) c.claimedToolUseId = null;
 		c.matchedToolCallIds.delete(toolUseId);
 		c.pendingResults.delete(toolUseId);
 		const pendingCall = c.pendingToolCalls.get(toolUseId);
@@ -1635,10 +1660,6 @@ function processStreamEvent(
 	c.turnSawStreamEvent = true;
 
 	if (event?.type === "message_start") {
-		if (c.awaitingTrailingAssistant) {
-			debug(`provider: trailing assistant missing before generation ${c.sdkTurnGeneration + 1}; clearing marker`);
-			c.awaitingTrailingAssistant = null;
-		}
 		c.sdkTurnGeneration++;
 		c.turnToolCallIds = [];
 		c.nextHandlerIdx = 0;
@@ -1680,8 +1701,12 @@ function processStreamEvent(
 					resolvePermissionPendingTool(c, event.content_block.id, false);
 					return;
 				}
-				c.turnToolCallIds.push(event.content_block.id);
-				c.claimedToolUseId = event.content_block.id;
+				if (!c.turnToolCallIds.includes(event.content_block.id)) {
+					c.turnToolCallIds.push(event.content_block.id);
+				}
+				if (!c.turnCoordinator.requirePermission || permission === "allow") {
+					c.claimedToolUseId = event.content_block.id;
+				}
 				const block: any = {
 					type: "toolCall", id: event.content_block.id,
 					name: mappedToolName,
@@ -1695,7 +1720,7 @@ function processStreamEvent(
 				c.currentPiStream!.push({ type: "toolcall_start", contentIndex, partial: c.turnOutput });
 				block.__piToolcallStartEmitted = true;
 			} else if (permission === "pending") {
-				c.permissionPendingBlocks.push({ block, contentIndex });
+				queuePermissionPendingBlock(c, block, contentIndex);
 			}
 		} else {
 			debug("processStreamEvent: unhandled content_block_start type", event.content_block?.type);
@@ -1712,9 +1737,7 @@ function processStreamEvent(
 			delete block.partialJson;
 			const permission = c.turnCoordinator.observeStreamArgs(block.id, block.arguments, true);
 			if (c.turnCoordinator.requirePermission && permission !== "allow") {
-				if (permission === "pending" && !c.permissionPendingBlocks.some((pending) => pending.block === block)) {
-					c.permissionPendingBlocks.push({ block, contentIndex: index });
-				}
+				if (permission === "pending") queuePermissionPendingBlock(c, block, index);
 				continue;
 			}
 			if (isEmptyArgs(block.arguments)) {
@@ -1788,9 +1811,7 @@ function processStreamEvent(
 			// blocks). This ensures message_stop's done-deferral check fires
 			// correctly even when ALL tool blocks had empty args.
 				if (c.turnCoordinator.requirePermission && permission !== "allow") {
-					if (permission === "pending" && !c.permissionPendingBlocks.some((pending) => pending.block === block)) {
-						c.permissionPendingBlocks.push({ block, contentIndex: index });
-					}
+					if (permission === "pending") queuePermissionPendingBlock(c, block, index);
 					return;
 				}
 				if (block.__piToolcallEndEmitted) return;
@@ -1881,8 +1902,6 @@ function processAssistantMessage(message: CbMessage, model: Model<any>, customTo
 			return;
 		}
 		ensureTurnStarted(c);
-		c.turnToolCallIds.push(block.id);
-		c.claimedToolUseId = block.id;
 		const mappedName = mapToolName(block.name, customToolNameToPi);
 		let mappedArgs = mapToolArgs(mappedName, {
 			...c.turnCoordinator.getArgs(block.id),
@@ -1895,6 +1914,8 @@ function processAssistantMessage(message: CbMessage, model: Model<any>, customTo
 			resolvePermissionPendingTool(c, block.id, false);
 			return;
 		}
+		if (!c.turnToolCallIds.includes(block.id)) c.turnToolCallIds.push(block.id);
+		if (!c.turnCoordinator.requirePermission || permission === "allow") c.claimedToolUseId = block.id;
 		c.turnBlocks.push({
 			type: "toolCall", id: block.id,
 			name: mappedName,
@@ -1909,7 +1930,7 @@ function processAssistantMessage(message: CbMessage, model: Model<any>, customTo
 			c.currentPiStream?.push({ type: "toolcall_end", contentIndex: idx, toolCall: toolBlock as any, partial: c.turnOutput });
 			toolBlock.__piToolcallEndEmitted = true;
 		} else if (permission === "pending") {
-			c.permissionPendingBlocks.push({ block: toolBlock, contentIndex: idx });
+			queuePermissionPendingBlock(c, toolBlock, idx);
 			c.doneDeferredForArgs = true;
 		}
 	}
@@ -1988,7 +2009,8 @@ function processAssistantMessage(message: CbMessage, model: Model<any>, customTo
 			&& !c.turnToolCallIds.includes(block.id)
 			&& !c.turnBlocks.some((turnBlock: any) => turnBlock.type === "toolCall" && turnBlock.id === block.id),
 		);
-		if (unseenToolUseBlocks.length === 0 || c.turnToolCallIds.length > 0) return;
+		if (unseenToolUseBlocks.length === 0) return;
+		if (!c.turnCoordinator.requirePermission && c.turnToolCallIds.length > 0) return;
 		debug(`processAssistantMessage: mixed stream/assistant path — ${unseenToolUseBlocks.length} unseen tool_use block(s)`);
 		for (const block of unseenToolUseBlocks) {
 			emitAssistantOnlyToolUse(block);
@@ -2817,16 +2839,19 @@ export function createCodebuddySdkExtension(
 		registry: runtimeRegistry,
 		streamSimple: runtimeStream,
 	});
-	let askRegistrationResolved = false;
-	let registeredAskAlias: string | undefined;
+	const registeredAskAliases = new Map<string, string>();
 	const registerRuntimeAsk = (
 		config: Readonly<Config>,
 		canonicalCwd: string,
 		warn: (message: string) => void,
 	): string | undefined => {
-		if (askRegistrationResolved) return registeredAskAlias;
-		registeredAskAlias = registerAskCodebuddyTool(pi, config, canonicalCwd, warn);
-		askRegistrationResolved = true;
+		const askConf = config.askCodebuddy;
+		if (askConf?.enabled === false) return undefined;
+		const toolName = askConf?.name ?? "AskCodebuddy";
+		const registeredAlias = registeredAskAliases.get(toolName);
+		if (registeredAlias !== undefined) return registeredAlias;
+		const registeredAskAlias = registerAskCodebuddyTool(pi, config, canonicalCwd, warn);
+		if (registeredAskAlias !== undefined) registeredAskAliases.set(registeredAskAlias, registeredAskAlias);
 		return registeredAskAlias;
 	};
 	let runtimeSnapshot: Readonly<RuntimeConfigSnapshot> | undefined;
@@ -2843,8 +2868,11 @@ export function createCodebuddySdkExtension(
 		}
 		try {
 			const isReload = event.reason === "reload";
-			const snapshot = runtimeSnapshot
+			const requestedCwd = canonicalizeProjectCwd(ctx.cwd);
+			const canRebindSnapshot = runtimeSnapshot
 				&& !isReload
+				&& runtimeSnapshot.canonicalCwd === requestedCwd;
+			const snapshot = canRebindSnapshot
 				? runtimeController.rebindSession(runtimeSnapshot, ctx.sessionManager.getSessionId())
 				: await runtimeController.start({
 					cwd: ctx.cwd,
@@ -2896,12 +2924,28 @@ export function createCodebuddySdkExtension(
 			`isSplitTurn=${event.preparation.isSplitTurn} messages=${event.preparation.messagesToSummarize.length} ` +
 			`turnPrefix=${event.preparation.turnPrefixMessages.length}`,
 		);
+		const sessionId = ctx.sessionManager.getSessionId();
+		let invocationRoute: ReturnType<RuntimeConfigRegistry["resolveSession"]>;
 		try {
-			const sessionId = ctx.sessionManager.getSessionId();
-			const invocationRoute = runtimeRegistry.resolveSession(sessionId);
-			if (!invocationRoute) {
-				throw new Error(`Pi session ${sessionId} does not belong to an active CodeBuddy runtime`);
-			}
+			invocationRoute = runtimeRegistry.resolveSession(sessionId);
+		} catch (err) {
+			const msg = errorMessage(err);
+			debug("session_before_compact: route lookup failed; allowing native compact fallback", err);
+			ctx.ui?.notify?.(
+				`CodeBuddy SDK compact skipped because its runtime route is unavailable (${redactForLog(msg)}). Falling back to pi compact.`,
+				"warning",
+			);
+			return undefined;
+		}
+		if (!invocationRoute) {
+			debug(`session_before_compact: no runtime route for session ${sessionId}; allowing native compact fallback`);
+			ctx.ui?.notify?.(
+				"CodeBuddy SDK compact skipped because this pi session is not routed to an active CodeBuddy runtime. Falling back to pi compact.",
+				"warning",
+			);
+			return undefined;
+		}
+		try {
 			const routedSummaryStream: RuntimeProviderStream = (model, context, options) => (
 				summaryStream(model, context, withProviderInvocationRoute(options, invocationRoute))
 			);

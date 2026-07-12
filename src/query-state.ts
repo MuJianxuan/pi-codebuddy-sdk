@@ -24,7 +24,6 @@ export interface PendingMcpDispatch {
 }
 
 export interface AwaitingTrailingAssistant {
-	generation: number;
 	toolCallIds: Set<string>;
 }
 
@@ -52,7 +51,7 @@ export class QueryContext {
 	// receives non-empty dispatch args. The done event is also deferred while
 	// this list is non-empty, so pi does not execute tools with empty args.
 	argsPendingBlocks: Array<{ block: any; contentIndex: number }> = [];
-	permissionPendingBlocks: Array<{ block: any; contentIndex: number }> = [];
+	permissionPendingBlocks: Array<{ block: any; contentIndex: number; deadlineTimer?: ReturnType<typeof setTimeout> }> = [];
 	permissionBufferedStreamEvents: any[] = [];
 	permissionBufferedAssistantMessages: any[] = [];
 	permissionReplayInProgress = false;
@@ -102,6 +101,9 @@ export class QueryContext {
 	 * assistant message starts.
 	 */
 	resetTurnState(model: Model<any>, preserveToolTurnState = false): void {
+		for (const pending of this.permissionPendingBlocks) {
+			if (pending.deadlineTimer) clearTimeout(pending.deadlineTimer);
+		}
 		this.turnOutput = {
 			role: "assistant", content: [],
 			api: model.api, provider: model.provider, model: model.id,

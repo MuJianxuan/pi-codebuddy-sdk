@@ -256,6 +256,10 @@ export class ToolTurnCoordinator {
 			record.denyReason = reason;
 			return { behavior: "deny", retryable: reason === "empty-required-args", reason };
 		}
+		if (record.permission === "deny" && record.denyReason === "empty-required-args") {
+			record.permission = "pending";
+			record.denyReason = undefined;
+		}
 		return this.authorizeRecord(record);
 	}
 

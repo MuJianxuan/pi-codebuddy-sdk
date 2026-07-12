@@ -342,6 +342,154 @@ describe("extension config lifecycle", () => {
 		}
 	}));
 
+	it("falls back to native compact when no runtime route exists", () => withTempHome(async () => {
+		const registry = createRuntimeConfigRegistry();
+		const fake = createFakeExtensionApi();
+		const notifications = [];
+		let compactCalls = 0;
+		const extension = createCodebuddySdkExtension({
+			runtimeRegistry: registry,
+			providerDispatcher: createProviderDispatcher(registry),
+			discoverModels: async () => {},
+			compact: async () => {
+				compactCalls++;
+				return { summary: "should not run" };
+			},
+		});
+		extension(fake.api);
+		try {
+			const result = await fake.handlers.get("session_before_compact")({
+				type: "session_before_compact",
+				reason: "manual",
+				willRetry: false,
+				branchEntries: [],
+				preparation: {
+					isSplitTurn: false,
+					messagesToSummarize: [],
+					turnPrefixMessages: [],
+					fileOps: { read: new Set(), edited: new Set() },
+				},
+				signal: new AbortController().signal,
+			}, {
+				cwd: tmpdir(),
+				hasUI: true,
+				ui: { notify: (message, type) => notifications.push({ message, type }) },
+				model: { baseUrl: "codebuddy" },
+				sessionManager: { getSessionId: () => "missing-compact-session" },
+			});
+
+			assert.equal(result, undefined);
+			assert.equal(compactCalls, 0);
+			assert.equal(notifications.some(({ type, message }) => type === "warning" && /Falling back to pi compact/.test(message)), true);
+		} finally {
+			await fake.handlers.get("session_shutdown")({ type: "session_shutdown", reason: "quit" }, {});
+		}
+	}));
+
+	it("falls back to native compact when runtime route lookup throws", () => withTempHome(async () => {
+		const baseRegistry = createRuntimeConfigRegistry();
+		const registry = {
+			...baseRegistry,
+			resolveSession(sessionId) {
+				if (sessionId === "throwing-compact-session") throw new Error("route registry unavailable");
+				return baseRegistry.resolveSession(sessionId);
+			},
+		};
+		const fake = createFakeExtensionApi();
+		const notifications = [];
+		let compactCalls = 0;
+		const extension = createCodebuddySdkExtension({
+			runtimeRegistry: registry,
+			providerDispatcher: createProviderDispatcher(registry),
+			discoverModels: async () => {},
+			compact: async () => {
+				compactCalls++;
+				return { summary: "should not run" };
+			},
+		});
+		extension(fake.api);
+		try {
+			const result = await fake.handlers.get("session_before_compact")({
+				type: "session_before_compact",
+				reason: "manual",
+				willRetry: false,
+				branchEntries: [],
+				preparation: {
+					isSplitTurn: false,
+					messagesToSummarize: [],
+					turnPrefixMessages: [],
+					fileOps: { read: new Set(), edited: new Set() },
+				},
+				signal: new AbortController().signal,
+			}, {
+				cwd: tmpdir(),
+				hasUI: true,
+				ui: { notify: (message, type) => notifications.push({ message, type }) },
+				model: { baseUrl: "codebuddy" },
+				sessionManager: { getSessionId: () => "throwing-compact-session" },
+			});
+
+			assert.equal(result, undefined);
+			assert.equal(compactCalls, 0);
+			assert.equal(notifications.some(({ type, message }) => type === "warning" && /route is unavailable/.test(message)), true);
+		} finally {
+			await fake.handlers.get("session_shutdown")({ type: "session_shutdown", reason: "quit" }, {});
+		}
+	}));
+
+	it("cancels compact when SDK takeover fails after a route is resolved", () => withTempHome(async (home) => {
+		const cwd = mkdtempSync(join(tmpdir(), "codebuddy-sdk-extension-project-"));
+		try {
+			const globalDir = join(home, ".pi", "agent");
+			mkdirSync(globalDir, { recursive: true });
+			writeFileSync(join(globalDir, "codebuddy-sdk.json"), JSON.stringify({
+				provider: { pathToCodebuddyCode: "/trusted/codebuddy" },
+			}));
+			const registry = createRuntimeConfigRegistry();
+			const fake = createFakeExtensionApi();
+			const notifications = [];
+			const extension = createCodebuddySdkExtension({
+				runtimeRegistry: registry,
+				providerDispatcher: createProviderDispatcher(registry),
+				discoverModels: async () => {},
+				compact: async () => {
+					throw new Error("summary failed");
+				},
+			});
+			extension(fake.api);
+			const context = {
+				cwd,
+				hasUI: true,
+				ui: {
+					select: async () => PROJECT_CONFIG_TRUST_CHOICES.allow,
+					notify: (message, type) => notifications.push({ message, type }),
+				},
+				model: { baseUrl: "codebuddy" },
+				sessionManager: { getSessionId: () => "failing-compact-session" },
+			};
+			await fake.handlers.get("session_start")({ type: "session_start", reason: "startup" }, context);
+			const result = await fake.handlers.get("session_before_compact")({
+				type: "session_before_compact",
+				reason: "manual",
+				willRetry: false,
+				branchEntries: [],
+				preparation: {
+					isSplitTurn: false,
+					messagesToSummarize: [],
+					turnPrefixMessages: [],
+					fileOps: { read: new Set(), edited: new Set() },
+				},
+				signal: new AbortController().signal,
+			}, context);
+
+			assert.deepEqual(result, { cancel: true });
+			assert.equal(notifications.some(({ type, message }) => type === "error" && /summary failed/.test(message)), true);
+			await fake.handlers.get("session_shutdown")({ type: "session_shutdown", reason: "quit" }, context);
+		} finally {
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	}));
+
 	it("warns on the console when Ask collides without UI", () => withTempHome(async (home) => {
 		const cwd = mkdtempSync(join(tmpdir(), "codebuddy-sdk-extension-project-"));
 		const oldWarn = console.warn;
@@ -470,6 +618,58 @@ describe("extension config lifecycle", () => {
 
 			await runtimeA.handlers.get("session_shutdown")({ type: "session_shutdown", reason: "quit" }, contextA);
 			await runtimeB.handlers.get("session_shutdown")({ type: "session_shutdown", reason: "quit" }, contextB);
+		} finally {
+			rmSync(cwdA, { recursive: true, force: true });
+			rmSync(cwdB, { recursive: true, force: true });
+		}
+	}));
+
+	it("restarts runtime config when a fork moves the same runtime to a different cwd", () => withTempHome(async (home) => {
+		const cwdA = mkdtempSync(join(tmpdir(), "codebuddy-sdk-extension-project-a-"));
+		const cwdB = mkdtempSync(join(tmpdir(), "codebuddy-sdk-extension-project-b-"));
+		try {
+			const globalDir = join(home, ".pi", "agent");
+			mkdirSync(globalDir, { recursive: true });
+			writeFileSync(join(globalDir, "codebuddy-sdk.json"), JSON.stringify({
+				provider: { appendSystemPrompt: false },
+			}));
+			for (const [cwd, appendSystemPrompt, askName] of [[cwdA, false, "AskA"], [cwdB, true, "AskB"]]) {
+				mkdirSync(join(cwd, ".pi"), { recursive: true });
+				writeFileSync(join(cwd, ".pi", "codebuddy-sdk.json"), JSON.stringify({
+					provider: { appendSystemPrompt },
+					askCodebuddy: { name: askName },
+				}));
+			}
+
+			const registry = createRuntimeConfigRegistry();
+			const fake = createFakeExtensionApi();
+			const extension = createCodebuddySdkExtension({
+				runtimeRegistry: registry,
+				providerDispatcher: createProviderDispatcher(registry),
+				discoverModels: async () => {},
+				createOwnerId: () => "fork-runtime",
+			});
+			extension(fake.api);
+			const contextFor = (cwd, sessionId) => ({
+				cwd,
+				hasUI: true,
+				ui: { select: async () => PROJECT_CONFIG_TRUST_CHOICES.allow, notify() {} },
+				sessionManager: { getSessionId: () => sessionId },
+			});
+
+			await fake.handlers.get("session_start")({ type: "session_start", reason: "startup" }, contextFor(cwdA, "fork-session-a"));
+			const routeA = registry.resolveSession("fork-session-a");
+			assert.equal(routeA.canonicalCwd, realpathSync.native(cwdA));
+			assert.equal(routeA.provider.appendSystemPrompt, false);
+			assert.deepEqual([...routeA.askAliases], ["AskA"]);
+
+			await fake.handlers.get("session_start")({ type: "session_start", reason: "fork" }, contextFor(cwdB, "fork-session-b"));
+			const routeB = registry.resolveSession("fork-session-b");
+			assert.equal(routeB.canonicalCwd, realpathSync.native(cwdB));
+			assert.equal(routeB.provider.appendSystemPrompt, true);
+			assert.deepEqual([...routeB.askAliases], ["AskB"]);
+			assert.deepEqual(fake.tools.map((tool) => tool.name), ["AskA", "AskB"]);
+			await fake.handlers.get("session_shutdown")({ type: "session_shutdown", reason: "quit" }, contextFor(cwdB, "fork-session-b"));
 		} finally {
 			rmSync(cwdA, { recursive: true, force: true });
 			rmSync(cwdB, { recursive: true, force: true });

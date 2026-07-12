@@ -801,6 +801,70 @@ describe("serial stream emission", () => {
 		assert.equal(events.filter((event) => event.type === "done").length, 1);
 	});
 
+	it("settles a permission-pending tool after message_stop when no SDK decision arrives", async (t) => {
+		t.mock.timers.enable({ apis: ["setTimeout"] });
+		ctx().resetTurnState(fakeModel);
+		const c = ctx();
+		c.turnCoordinator = new ToolTurnCoordinator({ requirePermission: true });
+		const events = [];
+		c.currentPiStream = { push(event) { events.push(event); }, end() { events.push({ type: "stream_end" }); } };
+		processStreamEvent({ event: {
+			type: "content_block_start", index: 0,
+			content_block: { type: "tool_use", id: "no-callback-id", name: "read", input: { path: "README.md" } },
+		} }, new Map(), fakeModel, c);
+		processStreamEvent({ event: { type: "content_block_stop", index: 0 } }, new Map(), fakeModel, c);
+		processStreamEvent({ event: { type: "message_stop" } }, new Map(), fakeModel, c);
+
+		assert.equal(events.some((event) => event.type === "done"), false);
+		assert.equal(c.permissionPendingBlocks.length, 1);
+
+		t.mock.timers.tick(30_000);
+		await Promise.resolve();
+
+		assert.equal(c.permissionPendingBlocks.length, 0);
+		assert.equal(c.currentPiStream, null);
+		assert.equal(events.filter((event) => event.type === "done").length, 1);
+		assert.equal(events.filter((event) => event.type === "stream_end").length, 1);
+		assert.equal(events.some((event) => event.type === "toolcall_start"), false);
+		assert.deepEqual(c.turnBlocks, []);
+	});
+
+	it("allows a same-turn retry with a new id after empty required args were denied", () => {
+		ctx().resetTurnState(fakeModel);
+		const c = ctx();
+		c.turnCoordinator = new ToolTurnCoordinator({
+			requirePermission: true,
+			hasRequiredArgs: (name) => name === "read",
+		});
+		const events = [];
+		c.currentPiStream = { push(event) { events.push(event); }, end() { events.push({ type: "stream_end" }); } };
+		const emit = (event) => processStreamEvent({ event }, new Map(), fakeModel, c);
+
+		emit({
+			type: "content_block_start", index: 0,
+			content_block: { type: "tool_use", id: "empty-id", name: "read", input: {} },
+		});
+		emit({ type: "content_block_stop", index: 0 });
+		c.turnCoordinator.recordPermissionDecision("empty-id", "read", "deny", "empty-required-args", {});
+		__test.resolvePermissionPendingTool(c, "empty-id", false);
+
+		emit({
+			type: "content_block_start", index: 1,
+			content_block: { type: "tool_use", id: "retry-id", name: "read", input: { path: "README.md" } },
+		});
+		__test.resolvePermissionPendingTool(c, "retry-id", true);
+		emit({ type: "content_block_stop", index: 1 });
+		emit({ type: "message_stop" });
+
+		assert.equal(c.claimedToolUseId, "retry-id");
+		assert.deepEqual(
+			events.filter((event) => event.type === "toolcall_end").map((event) => event.toolCall.id),
+			["retry-id"],
+		);
+		assert.deepEqual(events.find((event) => event.type === "toolcall_end").toolCall.arguments, { path: "README.md" });
+		assert.equal(events.filter((event) => event.type === "done").length, 1);
+	});
+
 	it("does not leave a denied id in Pi content or pending matching state", () => {
 		ctx().resetTurnState(fakeModel);
 		const c = ctx();
@@ -938,6 +1002,65 @@ describe("serial stream emission", () => {
 		assert.deepEqual(
 			events.filter((event) => event.type === "toolcall_end").map((event) => event.toolCall.id),
 			["old-tool-id", "next-tool-id"],
+		);
+	});
+
+	it("consumes a delayed completed assistant by parent tool id after the next stream starts", () => {
+		const { c, events } = setupStream();
+		finishStreamedToolTurn(c, "old-tool-id", "read", { path: "old.txt" });
+		c.currentPiStream = {
+			push(event) { events.push(event); },
+			end() { events.push({ type: "stream_end" }); },
+		};
+		c.resetTurnState(fakeModelWithCost, true);
+		emit({ type: "message_start", index: 0, message: {} }, c);
+
+		processAssistantMessage({
+			type: "assistant",
+			parent_tool_use_id: "old-tool-id",
+			message: {
+				content: [{
+					type: "tool_use",
+					id: "old-tool-id",
+					name: "read",
+					input: { path: "old.txt" },
+				}],
+			},
+		}, fakeModelWithCost, new Map(), c);
+
+		assert.equal(c.awaitingTrailingAssistant, null);
+		assert.deepEqual(
+			events.filter((event) => event.type === "toolcall_end").map((event) => event.toolCall.id),
+			["old-tool-id"],
+		);
+	});
+
+	it("delivers a fresh assistant with a null parent even when it reuses an old tool id", () => {
+		const { c, events } = setupStream();
+		finishStreamedToolTurn(c, "old-tool-id", "read", { path: "old.txt" });
+		c.currentPiStream = {
+			push(event) { events.push(event); },
+			end() { events.push({ type: "stream_end" }); },
+		};
+		c.resetTurnState(fakeModelWithCost, true);
+		emit({ type: "message_start", index: 0, message: {} }, c);
+
+		processAssistantMessage({
+			type: "assistant",
+			parent_tool_use_id: null,
+			message: {
+				content: [{
+					type: "tool_use",
+					id: "old-tool-id",
+					name: "read",
+					input: { path: "fresh.txt" },
+				}],
+			},
+		}, fakeModelWithCost, new Map(), c);
+
+		assert.deepEqual(
+			events.filter((event) => event.type === "toolcall_end").map((event) => event.toolCall.arguments),
+			[{ path: "old.txt" }, { path: "fresh.txt" }],
 		);
 	});
 

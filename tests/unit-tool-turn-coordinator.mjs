@@ -57,6 +57,21 @@ describe("ToolTurnCoordinator", () => {
 		assert.deepEqual(coordinator.snapshot().allowedIds, ["good"]);
 	});
 
+	it("can reauthorize a retryable empty-args denial for the same id", () => {
+		const events = [];
+		const coordinator = createCoordinator(events, { hasRequiredArgs: (name) => name === "bash" });
+		const empty = coordinator.recordPermissionDecision("retry-id", "bash", "deny", "empty-required-args", {});
+		assert.deepEqual(empty, { behavior: "deny", retryable: true, reason: "empty-required-args" });
+
+		const valid = coordinator.recordPermissionDecision("retry-id", "bash", "allow", undefined, { command: "ls" });
+		assert.deepEqual(valid, { behavior: "allow", retryable: false });
+		assert.deepEqual(coordinator.snapshot().allowedIds, ["retry-id"]);
+		assert.deepEqual(events.map(({ type, toolUseId }) => [type, toolUseId]), [
+			["toolcall_start", "retry-id"],
+			["toolcall_end", "retry-id"],
+		]);
+	});
+
 	it("applies required-args and serial gates to implicit dispatch permission", () => {
 		const coordinator = createCoordinator([], { hasRequiredArgs: (name) => name === "bash" });
 		coordinator.observeStreamStart("read-id", "read", {});
