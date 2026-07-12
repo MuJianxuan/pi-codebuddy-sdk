@@ -8,7 +8,9 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { jsonSchemaToZodObjectForMcp } from "../src/typebox-to-zod.js";
+import { createAllToolDefinitions } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/tools/index.js";
+import { Type } from "typebox";
+import { jsonSchemaToZodObjectForMcp, tryJsonSchemaToZodObjectForMcp } from "../src/typebox-to-zod.js";
 
 describe("jsonSchemaToZodObjectForMcp", () => {
 	it("rejects empty {} when there are required fields", () => {
@@ -127,5 +129,73 @@ describe("jsonSchemaToZodObjectForMcp", () => {
 		assert.deepEqual(schema.parse({ mode: "read" }), { mode: "read" });
 		assert.throws(() => schema.parse({ mode: "invalid" }));
 		assert.throws(() => schema.parse({}));
+	});
+
+	it("uses integer validation instead of treating integer as a number", () => {
+		const schema = jsonSchemaToZodObjectForMcp({
+			type: "object",
+			properties: { count: { type: "integer" } },
+			required: ["count"],
+		});
+		assert.deepEqual(schema.parse({ count: 2 }), { count: 2 });
+		assert.throws(() => schema.parse({ count: 2.5 }));
+	});
+
+	it("fails closed on unsupported schema constructs", () => {
+		const result = tryJsonSchemaToZodObjectForMcp({
+			type: "object",
+			properties: { value: { $ref: "#/$defs/value" } },
+		});
+		assert.equal(result.schema, undefined);
+		assert.equal(result.error.keyword, "$ref");
+		assert.equal(result.error.path, "$.properties.value");
+		const selectivePattern = tryJsonSchemaToZodObjectForMcp({
+			type: "object",
+			patternProperties: { "^x": { type: "string" } },
+		});
+		assert.equal(selectivePattern.schema, undefined);
+		assert.equal(selectivePattern.error.keyword, "patternProperties");
+		assert.throws(() => jsonSchemaToZodObjectForMcp({ type: "array", prefixItems: [{ type: "string" }] }));
+	});
+
+	it("supports Type.Record metadata maps used by TaskCreate and TaskUpdate", () => {
+		const schema = Type.Object({
+			metadata: Type.Optional(Type.Record(Type.String(), Type.Any())),
+		});
+		const result = tryJsonSchemaToZodObjectForMcp(schema);
+		assert.ok(result.schema, JSON.stringify(result.error));
+		assert.deepEqual(result.schema.parse({}), {});
+		assert.deepEqual(result.schema.parse({ metadata: { agentId: "agent-123", priority: 2 } }), {
+			metadata: { agentId: "agent-123", priority: 2 },
+		});
+	});
+
+	it("honors additionalProperties false instead of silently passthrough", () => {
+		const schema = jsonSchemaToZodObjectForMcp({
+			type: "object",
+			properties: { value: { type: "string" } },
+			additionalProperties: false,
+		});
+		assert.deepEqual(schema.parse({ value: "ok" }), { value: "ok" });
+		assert.throws(() => schema.parse({ value: "ok", extra: true }));
+	});
+
+	it("converts every current Pi built-in tool fixture", () => {
+		const definitions = createAllToolDefinitions(process.cwd());
+		const schemas = Object.fromEntries(Object.entries(definitions).map(([name, definition]) => {
+			const result = tryJsonSchemaToZodObjectForMcp(definition.parameters);
+			assert.ok(result.schema, `${name} should be supported: ${JSON.stringify(result.error)}`);
+			return [name, result.schema];
+		}));
+
+		assert.doesNotThrow(() => schemas.read.parse({ path: "README.md" }));
+		assert.throws(() => schemas.read.parse({}));
+		assert.doesNotThrow(() => schemas.bash.parse({ command: "ls" }));
+		assert.throws(() => schemas.bash.parse({}));
+		assert.doesNotThrow(() => schemas.edit.parse({ path: "README.md", edits: [{ oldText: "a", newText: "b" }] }));
+		assert.doesNotThrow(() => schemas.write.parse({ path: "new.txt", content: "hello" }));
+		assert.doesNotThrow(() => schemas.grep.parse({ pattern: "needle" }));
+		assert.doesNotThrow(() => schemas.find.parse({ pattern: "**/*.ts" }));
+		assert.doesNotThrow(() => schemas.ls.parse({}));
 	});
 });

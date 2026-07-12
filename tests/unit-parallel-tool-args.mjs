@@ -14,9 +14,18 @@
 import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { ctx, resetStack } from "../src/query-state.js";
+import { ToolTurnCoordinator } from "../src/tool-turn-coordinator.js";
 import { __test } from "../src/index.js";
 
-const { claimSerialToolUse, interruptLiveQuery, isEmptyArgs, processStreamEvent } = __test;
+const {
+	claimSerialToolUse,
+	interruptLiveQuery,
+	isEmptyArgs,
+	mapToolArgs,
+	processStreamEvent,
+	processAssistantMessage,
+	buildMcpServers,
+} = __test;
 
 const fakeModel = { api: "anthropic", provider: "anthropic", id: "test-model" };
 
@@ -71,6 +80,17 @@ describe("isEmptyArgs", () => {
 	it("returns false for object with empty array value", () => {
 		// An empty array is still a value
 		assert.strictEqual(isEmptyArgs({ items: [] }), false);
+	});
+});
+
+describe("mapToolArgs", () => {
+	it("does not turn empty bash args into a timeout-only object", () => {
+		assert.deepStrictEqual(mapToolArgs("bash", {}), {});
+		assert.deepStrictEqual(mapToolArgs("bash", undefined), {});
+	});
+
+	it("adds the bash timeout only when real args exist", () => {
+		assert.deepStrictEqual(mapToolArgs("bash", { command: "ls" }), { command: "ls", timeout: 120 });
 	});
 });
 
@@ -626,6 +646,651 @@ describe("serial tool-call gate", () => {
 		const retry = canUseToolDecisionWithSerial(ctx(), "read", { path: "/tmp/file.txt" }, "toolu_retry");
 		assert.strictEqual(retry.behavior, "allow");
 		assert.strictEqual(ctx().claimedToolUseId, "toolu_retry");
+	});
+});
+
+describe("serial stream emission", () => {
+	beforeEach(() => resetStack());
+
+	function setupStream() {
+		ctx().resetTurnState(fakeModelWithCost);
+		const c = ctx();
+		const events = [];
+		c.currentPiStream = {
+			push(event) { events.push(event); },
+			end() { events.push({ type: "stream_end" }); },
+		};
+		return { c, events };
+	}
+
+	const fakeModelWithCost = {
+		api: "anthropic", provider: "anthropic", id: "test-model",
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	};
+
+	function emit(event, c) {
+		processStreamEvent({ event }, new Map(), fakeModelWithCost, c);
+	}
+
+	function finishStreamedToolTurn(c, id, name, input) {
+		emit({ type: "message_start", index: 0, message: {} }, c);
+		emit({
+			type: "content_block_start", index: 0,
+			content_block: { type: "tool_use", id, name, input },
+		}, c);
+		emit({ type: "content_block_stop", index: 0 }, c);
+		emit({ type: "message_stop" }, c);
+	}
+
+	it("does not expose a second tool when its content_block_stop is missing", () => {
+		const { c, events } = setupStream();
+
+		emit({
+			type: "content_block_start", index: 0,
+			content_block: { type: "tool_use", id: "t1", name: "read", input: { path: "a.txt" } },
+		}, c);
+		emit({
+			type: "content_block_start", index: 1,
+			content_block: { type: "tool_use", id: "t2", name: "read", input: {} },
+		}, c);
+		emit({ type: "content_block_stop", index: 0 }, c);
+		emit({ type: "message_stop" }, c);
+
+		assert.deepStrictEqual(
+			events.filter((event) => event.type === "toolcall_start").map((event) => event.partial.content.at(-1).id),
+			["t1"],
+		);
+		assert.deepStrictEqual(
+			events.filter((event) => event.type === "toolcall_end").map((event) => event.toolCall.id),
+			["t1"],
+		);
+		assert.strictEqual(events.filter((event) => event.type === "done").length, 1);
+		assert.deepStrictEqual(c.turnToolCallIds, ["t1"]);
+		assert.strictEqual(c.claimedToolUseId, "t1");
+		assert.strictEqual(claimSerialToolUse(c, "t2"), false);
+	});
+
+	it("backfills an open first tool block from the assistant message", () => {
+		const { c, events } = setupStream();
+
+		emit({
+			type: "content_block_start", index: 0,
+			content_block: { type: "tool_use", id: "t1", name: "read", input: {} },
+		}, c);
+		emit({ type: "message_stop" }, c);
+
+		assert.strictEqual(c.argsPendingBlocks.length, 1);
+		assert.strictEqual(events.filter((event) => event.type === "done").length, 0);
+
+		processAssistantMessage({
+			type: "assistant",
+			message: {
+				content: [{ type: "tool_use", id: "t1", name: "read", input: { path: "validation.md" } }],
+			},
+		}, fakeModelWithCost, new Map(), c);
+
+		const ends = events.filter((event) => event.type === "toolcall_end");
+		assert.strictEqual(ends.length, 1);
+		assert.strictEqual(ends[0].toolCall.id, "t1");
+		assert.deepStrictEqual(ends[0].toolCall.arguments, { path: "validation.md" });
+		assert.strictEqual(events.filter((event) => event.type === "done").length, 1);
+		assert.strictEqual(c.argsPendingBlocks.length, 0);
+	});
+
+	it("emits only the first tool from a parallel complete batch", () => {
+		const { c, events } = setupStream();
+
+		emit({
+			type: "content_block_start", index: 0,
+			content_block: { type: "tool_use", id: "t1", name: "read", input: { path: "a.txt" } },
+		}, c);
+		emit({
+			type: "content_block_start", index: 1,
+			content_block: { type: "tool_use", id: "t2", name: "bash", input: { command: "ls" } },
+		}, c);
+		emit({ type: "content_block_stop", index: 0 }, c);
+		emit({ type: "content_block_stop", index: 1 }, c);
+		emit({ type: "message_stop" }, c);
+
+		assert.deepStrictEqual(
+			events.filter((event) => event.type === "toolcall_end").map((event) => event.toolCall.id),
+			["t1"],
+		);
+		assert.deepStrictEqual(c.turnToolCallIds, ["t1"]);
+		assert.strictEqual(events.filter((event) => event.type === "done").length, 1);
+	});
+
+	it("emits only the first tool on the assistant-message fallback path", () => {
+		const { c, events } = setupStream();
+
+		processAssistantMessage({
+			type: "assistant",
+			message: {
+				content: [
+					{ type: "tool_use", id: "t1", name: "read", input: { path: "a.txt" } },
+					{ type: "tool_use", id: "t2", name: "bash", input: { command: "ls" } },
+				],
+			},
+		}, fakeModelWithCost, new Map(), c);
+
+		assert.deepStrictEqual(
+			events.filter((event) => event.type === "toolcall_end").map((event) => event.toolCall.id),
+			["t1"],
+		);
+		assert.deepStrictEqual(c.turnToolCallIds, ["t1"]);
+		assert.strictEqual(events.filter((event) => event.type === "done").length, 1);
+	});
+
+	it("buffers production tool events until the permission decision allows the id", () => {
+		ctx().resetTurnState(fakeModel);
+		const c = ctx();
+		c.turnCoordinator = new ToolTurnCoordinator({ requirePermission: true });
+		const events = [];
+		c.currentPiStream = { push(event) { events.push(event); }, end() { events.push({ type: "stream_end" }); } };
+		processStreamEvent({ event: {
+			type: "content_block_start", index: 0,
+			content_block: { type: "tool_use", id: "permission-id", name: "read", input: { path: "README.md" } },
+		} }, new Map(), fakeModel, c);
+		processStreamEvent({ event: { type: "content_block_stop", index: 0 } }, new Map(), fakeModel, c);
+		processStreamEvent({ event: { type: "message_stop" } }, new Map(), fakeModel, c);
+		assert.equal(events.some((event) => event.type === "toolcall_start"), false);
+		assert.equal(events.some((event) => event.type === "toolcall_end"), false);
+		__test.resolvePermissionPendingTool(c, "permission-id", true);
+		assert.equal(events.filter((event) => event.type === "toolcall_start").length, 1);
+		assert.equal(events.filter((event) => event.type === "toolcall_end").length, 1);
+		assert.equal(events.filter((event) => event.type === "done").length, 1);
+	});
+
+	it("does not leave a denied id in Pi content or pending matching state", () => {
+		ctx().resetTurnState(fakeModel);
+		const c = ctx();
+		c.turnCoordinator = new ToolTurnCoordinator({ requirePermission: true });
+		const events = [];
+		c.currentPiStream = { push(event) { events.push(event); }, end() {} };
+		processStreamEvent({ event: {
+			type: "content_block_start", index: 0,
+			content_block: { type: "tool_use", id: "denied-id", name: "read", input: { path: "README.md" } },
+		} }, new Map(), fakeModel, c);
+		__test.resolvePermissionPendingTool(c, "denied-id", false);
+		assert.deepEqual(c.turnToolCallIds, []);
+		assert.deepEqual(c.turnBlocks, []);
+		assert.equal(c.matchedToolCallIds.has("denied-id"), false);
+		assert.equal(events.some((event) => event.type === "toolcall_start"), false);
+	});
+
+	it("keeps later text indexes contiguous when a pending tool is denied", () => {
+		ctx().resetTurnState(fakeModel);
+		const c = ctx();
+		c.turnCoordinator = new ToolTurnCoordinator({ requirePermission: true });
+		const events = [];
+		c.currentPiStream = { push(event) { events.push(event); }, end() { events.push({ type: "stream_end" }); } };
+
+		const emit = (event) => processStreamEvent({ event }, new Map(), fakeModel, c);
+		emit({ type: "content_block_start", index: 0, content_block: { type: "text" } });
+		emit({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "before" } });
+		emit({ type: "content_block_stop", index: 0 });
+		emit({ type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "denied-late", name: "read", input: { path: "secret.txt" } } });
+		emit({ type: "content_block_stop", index: 1 });
+		emit({ type: "content_block_start", index: 2, content_block: { type: "text" } });
+		emit({ type: "content_block_delta", index: 2, delta: { type: "text_delta", text: "after" } });
+		emit({ type: "content_block_stop", index: 2 });
+		emit({ type: "message_stop" });
+
+		assert.equal(events.filter((event) => event.type === "text_start").length, 1);
+		assert.equal(events.filter((event) => event.type === "text_end").length, 1);
+		__test.resolvePermissionPendingTool(c, "denied-late", false);
+
+		assert.deepEqual(c.turnBlocks.map((block) => block.type), ["text", "text"]);
+		assert.deepEqual(events.filter((event) => event.type === "text_start").map((event) => event.contentIndex), [0, 1]);
+		assert.deepEqual(events.filter((event) => event.type === "text_end").map((event) => event.contentIndex), [0, 1]);
+		assert.equal(events.filter((event) => event.type === "toolcall_start").length, 0);
+		assert.equal(events.filter((event) => event.type === "done").length, 1);
+	});
+
+	it("uses permission input when permission arrives before the stream block", () => {
+		ctx().resetTurnState(fakeModel);
+		const c = ctx();
+		c.turnCoordinator = new ToolTurnCoordinator({ requirePermission: true });
+		c.turnCoordinator.recordPermissionDecision("pre-authorized", "read", "allow", undefined, { path: "from-permission.txt" });
+		const events = [];
+		c.currentPiStream = { push(event) { events.push(event); }, end() {} };
+		const emit = (event) => processStreamEvent({ event }, new Map(), fakeModel, c);
+		emit({ type: "message_start", index: 0, message: {} });
+		emit({ type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "pre-authorized", name: "read", input: {} } });
+		emit({ type: "content_block_stop", index: 0 });
+		emit({ type: "message_stop" });
+
+		const end = events.find((event) => event.type === "toolcall_end");
+		assert.deepEqual(end.toolCall.arguments, { path: "from-permission.txt" });
+		assert.equal(events.filter((event) => event.type === "toolcall_start").length, 1);
+		assert.equal(events.filter((event) => event.type === "toolcall_end").length, 1);
+	});
+
+	it("ignores the completed assistant from a tool turn after a fast result resumes the stream", () => {
+		const { c, events } = setupStream();
+		c.turnCoordinator = new ToolTurnCoordinator({ requirePermission: true });
+		c.turnCoordinator.recordPermissionDecision(
+			"old-tool-id",
+			"get_subagent_result",
+			"allow",
+			undefined,
+			{ agent_id: "agent-1" },
+		);
+
+		emit({ type: "message_start", index: 0, message: {} }, c);
+		emit({
+			type: "content_block_start", index: 0,
+			content_block: {
+				type: "tool_use",
+				id: "old-tool-id",
+				name: "get_subagent_result",
+				input: { agent_id: "agent-1" },
+			},
+		}, c);
+		emit({ type: "content_block_stop", index: 0 }, c);
+		emit({ type: "message_stop" }, c);
+
+		assert.equal(c.currentPiStream, null);
+
+		// Pi delivers an immediate result and installs the continuation stream before
+		// the SDK yields the completed assistant snapshot for the previous tool turn.
+		c.currentPiStream = {
+			push(event) { events.push(event); },
+			end() { events.push({ type: "stream_end" }); },
+		};
+		c.resetTurnState(fakeModelWithCost, true);
+		processAssistantMessage({
+			type: "assistant",
+			message: {
+				content: [{
+					type: "tool_use",
+					id: "old-tool-id",
+					name: "get_subagent_result",
+					input: { agent_id: "agent-1" },
+				}],
+			},
+		}, fakeModelWithCost, new Map(), c);
+
+		assert.deepEqual(c.permissionPendingBlocks, []);
+
+		emit({ type: "message_start", index: 0, message: {} }, c);
+		assert.equal(c.permissionBufferedStreamEvents.length, 0);
+		c.turnCoordinator.recordPermissionDecision(
+			"next-tool-id",
+			"read",
+			"allow",
+			undefined,
+			{ path: "src/tool-turn-coordinator.ts" },
+		);
+		emit({
+			type: "content_block_start", index: 0,
+			content_block: {
+				type: "tool_use",
+				id: "next-tool-id",
+				name: "read",
+				input: { path: "src/tool-turn-coordinator.ts" },
+			},
+		}, c);
+		emit({ type: "content_block_stop", index: 0 }, c);
+		emit({ type: "message_stop" }, c);
+
+		assert.equal(events.filter((event) => event.type === "toolcall_start").length, 2);
+		assert.deepEqual(
+			events.filter((event) => event.type === "toolcall_end").map((event) => event.toolCall.id),
+			["old-tool-id", "next-tool-id"],
+		);
+	});
+
+	it("delivers a fresh assistant that calls the same tool with a different id", () => {
+		const { c, events } = setupStream();
+		finishStreamedToolTurn(c, "old-tool-id", "read", { path: "old.txt" });
+		c.currentPiStream = {
+			push(event) { events.push(event); },
+			end() { events.push({ type: "stream_end" }); },
+		};
+		c.resetTurnState(fakeModelWithCost, true);
+
+		processAssistantMessage({
+			type: "assistant",
+			message: {
+				content: [{
+					type: "tool_use",
+					id: "new-tool-id",
+					name: "read",
+					input: { path: "new.txt" },
+				}],
+			},
+		}, fakeModelWithCost, new Map(), c);
+
+		assert.deepEqual(
+			events.filter((event) => event.type === "toolcall_end").map((event) => event.toolCall.id),
+			["old-tool-id", "new-tool-id"],
+		);
+	});
+
+	it("consumes the completed assistant before the tool-result continuation stream is attached", () => {
+		const { c, events } = setupStream();
+		finishStreamedToolTurn(c, "old-tool-id", "read", { path: "old.txt" });
+
+		processAssistantMessage({
+			type: "assistant",
+			message: {
+				content: [{
+					type: "tool_use",
+					id: "old-tool-id",
+					name: "read",
+					input: { path: "old.txt" },
+				}],
+			},
+		}, fakeModelWithCost, new Map(), c);
+
+		assert.equal(c.awaitingTrailingAssistant, null);
+		assert.equal(events.filter((event) => event.type === "toolcall_end").length, 1);
+	});
+
+	it("delivers a text-only assistant while a trailing assistant marker is armed", () => {
+		const { c, events } = setupStream();
+		finishStreamedToolTurn(c, "old-tool-id", "read", { path: "old.txt" });
+		c.currentPiStream = {
+			push(event) { events.push(event); },
+			end() { events.push({ type: "stream_end" }); },
+		};
+		c.resetTurnState(fakeModelWithCost, true);
+
+		processAssistantMessage({
+			type: "assistant",
+			message: {
+				content: [{ type: "text", text: "fresh text-only answer" }],
+			},
+		}, fakeModelWithCost, new Map(), c);
+
+		assert.equal(
+			events.some((event) => event.type === "text_delta" && event.delta === "fresh text-only answer"),
+			true,
+		);
+	});
+
+	it("clears a trailing assistant marker when a malformed assistant fails open", () => {
+		const { c, events } = setupStream();
+		finishStreamedToolTurn(c, "old-tool-id", "read", { path: "old.txt" });
+		c.currentPiStream = {
+			push(event) { events.push(event); },
+			end() { events.push({ type: "stream_end" }); },
+		};
+		c.resetTurnState(fakeModelWithCost, true);
+
+		processAssistantMessage({
+			type: "assistant",
+			message: { content: null },
+		}, fakeModelWithCost, new Map(), c);
+
+		assert.equal(c.awaitingTrailingAssistant, null);
+	});
+
+	it("advances the generation for an assistant-message fallback turn", () => {
+		const { c, events } = setupStream();
+		assert.equal(c.sdkTurnGeneration, 0);
+
+		processAssistantMessage({
+			type: "assistant",
+			message: { content: [{ type: "text", text: "fallback answer" }] },
+		}, fakeModelWithCost, new Map(), c);
+
+		assert.equal(c.sdkTurnGeneration, 1);
+		assert.equal(events.some((event) => event.type === "text_delta" && event.delta === "fallback answer"), true);
+	});
+
+	function setupMcpDispatchHarness() {
+		ctx().resetTurnState(fakeModel);
+		const c = ctx();
+		c.turnCoordinator = new ToolTurnCoordinator({ requirePermission: true });
+		const events = [];
+		c.currentPiStream = {
+			push(event) { events.push(event); },
+			end() { events.push({ type: "stream_end" }); },
+		};
+		const tool = {
+			name: "read",
+			description: "read a file",
+			parameters: {
+				type: "object",
+				properties: { path: { type: "string" } },
+				required: ["path"],
+			},
+		};
+		const bridge = buildMcpServers([tool], c);
+		const handler = bridge.servers.custom_tools.instance._registeredTools.read.handler;
+		const emit = (event) => processStreamEvent({ event }, new Map(), fakeModel, c);
+		return { c, events, handler, emit };
+	}
+
+	async function resolvePiResult(c, toolCallId, handlerPromise) {
+		const pending = c.pendingToolCalls.get(toolCallId);
+		assert.ok(pending, `MCP handler ${toolCallId} should wait for the Pi tool result`);
+		pending.resolve({ content: [{ type: "text", text: "ok" }] });
+		await handlerPromise;
+	}
+
+	it("releases a pending tool when MCP dispatch arrives without a canUseTool callback", async () => {
+		const { c, events, handler, emit } = setupMcpDispatchHarness();
+		emit({
+			type: "content_block_start", index: 0,
+			content_block: { type: "tool_use", id: "dispatch-late", name: "read", input: { path: "a.txt" } },
+		});
+		emit({ type: "content_block_stop", index: 0 });
+		emit({ type: "message_stop" });
+
+		const handlerPromise = handler({ path: "a.txt" });
+		await Promise.resolve();
+
+		assert.deepEqual(events.filter((event) => event.type).map((event) => event.type), [
+			"start", "toolcall_start", "toolcall_end", "done", "stream_end",
+		]);
+		assert.equal(c.permissionPendingBlocks.length, 0);
+		assert.equal(c.currentPiStream, null);
+		assert.deepEqual(events.find((event) => event.type === "toolcall_end").toolCall.arguments, { path: "a.txt" });
+
+		await resolvePiResult(c, "dispatch-late", handlerPromise);
+	});
+
+	it("executes correctly when MCP dispatch arrives before the stream block", async () => {
+		const { c, events, handler, emit } = setupMcpDispatchHarness();
+		const handlerPromise = handler({ path: "a.txt" });
+
+		emit({
+			type: "content_block_start", index: 0,
+			content_block: { type: "tool_use", id: "dispatch-early", name: "read", input: {} },
+		});
+		emit({ type: "content_block_stop", index: 0 });
+		emit({ type: "message_stop" });
+		await Promise.resolve();
+
+		assert.deepEqual(events.filter((event) => event.type).map((event) => event.type), [
+			"start", "toolcall_start", "toolcall_end", "done", "stream_end",
+		]);
+		assert.equal(c.permissionPendingBlocks.length, 0);
+		assert.equal(c.pendingMcpDispatches.length, 0);
+		assert.deepEqual(events.find((event) => event.type === "toolcall_end").toolCall.arguments, { path: "a.txt" });
+
+		await resolvePiResult(c, "dispatch-early", handlerPromise);
+	});
+
+	it("times out an MCP dispatch that never receives a stream tool id", async (t) => {
+		t.mock.timers.enable({ apis: ["setTimeout"] });
+		const { c, handler } = setupMcpDispatchHarness();
+		let settled;
+		void handler({ path: "never-streamed.txt" }).then((result) => { settled = result; });
+
+		await Promise.resolve();
+		assert.equal(c.pendingMcpDispatches.length, 1);
+		assert.equal(c.turnCoordinator.snapshot().pendingDispatches, 1);
+		t.mock.timers.tick(29_999);
+		await Promise.resolve();
+		assert.equal(settled, undefined);
+
+		t.mock.timers.tick(1);
+		await Promise.resolve();
+		await Promise.resolve();
+		assert.equal(settled?.isError, true);
+		assert.match(settled?.content?.[0]?.text ?? "", /timed out/i);
+		assert.equal(c.pendingMcpDispatches.length, 0);
+		assert.equal(c.turnCoordinator.snapshot().pendingDispatches, 0);
+	});
+
+	it("does not time out a dispatch after it binds to a stream tool id", async (t) => {
+		t.mock.timers.enable({ apis: ["setTimeout"] });
+		const { c, handler, emit } = setupMcpDispatchHarness();
+		let settled;
+		const handlerPromise = handler({ path: "long-running.txt" });
+		void handlerPromise.then((result) => { settled = result; });
+
+		emit({
+			type: "content_block_start", index: 0,
+			content_block: { type: "tool_use", id: "long-running-id", name: "read", input: {} },
+		});
+		emit({ type: "content_block_stop", index: 0 });
+		emit({ type: "message_stop" });
+		await Promise.resolve();
+
+		assert.equal(c.pendingMcpDispatches.length, 0);
+		assert.equal(c.pendingToolCalls.has("long-running-id"), true);
+		t.mock.timers.tick(300_000);
+		await Promise.resolve();
+		assert.equal(settled, undefined);
+
+		await resolvePiResult(c, "long-running-id", handlerPromise);
+	});
+
+	it("does not execute a tool after an explicit permission deny", async () => {
+		const { c, events, handler, emit } = setupMcpDispatchHarness();
+		emit({
+			type: "content_block_start", index: 0,
+			content_block: { type: "tool_use", id: "explicit-deny", name: "read", input: { path: "secret.txt" } },
+		});
+		__test.resolvePermissionPendingTool(c, "explicit-deny", false);
+
+		const timeout = Symbol("timeout");
+		let timer;
+		const result = await Promise.race([
+			handler({ path: "secret.txt" }),
+			new Promise((resolve) => { timer = setTimeout(() => resolve(timeout), 100); }),
+		]);
+		clearTimeout(timer);
+
+		assert.notEqual(result, timeout, "a denied dispatch must not leave the MCP handler waiting");
+		assert.equal(result.isError, true);
+		assert.equal(events.some((event) => event.type === "toolcall_start"), false);
+		assert.equal(events.some((event) => event.type === "toolcall_end"), false);
+	});
+
+	it("does not orphan a sibling MCP dispatch across the first tool-result reset", async () => {
+		ctx().resetTurnState(fakeModel);
+		const c = ctx();
+		c.turnCoordinator = new ToolTurnCoordinator({ requirePermission: true });
+		const events = [];
+		c.currentPiStream = {
+			push(event) { events.push(event); },
+			end() { events.push({ type: "stream_end" }); },
+		};
+		const tools = [
+			{
+				name: "read",
+				description: "read a file",
+				parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+			},
+			{
+				name: "bash",
+				description: "run a command",
+				parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] },
+			},
+		];
+		const bridge = buildMcpServers(tools, c);
+		const read = bridge.servers.custom_tools.instance._registeredTools.read.handler;
+		const bash = bridge.servers.custom_tools.instance._registeredTools.bash.handler;
+		const emit = (event) => processStreamEvent({ event }, new Map(), fakeModel, c);
+
+		emit({ type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "read-id", name: "read", input: { path: "README.md" } } });
+		emit({ type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "bash-id", name: "bash", input: { command: "ls" } } });
+		const readPromise = read({ path: "README.md" });
+		await Promise.resolve();
+
+		assert.ok(c.permissionPendingBlocks.some((pending) => pending.block.id === "bash-id"));
+		const readPending = c.pendingToolCalls.get("read-id");
+		assert.ok(readPending);
+
+		// streamCodebuddySdk currently performs this reset before resolving the
+		// first Pi tool result. The sibling handler must remain resolvable.
+		c.resetTurnState(fakeModel, true);
+		readPending.resolve({ content: [{ type: "text", text: "read ok" }] });
+		await readPromise;
+
+		const timeout = Symbol("timeout");
+		let timer;
+		const bashResult = await Promise.race([
+			bash({ command: "ls" }),
+			new Promise((resolve) => { timer = setTimeout(() => resolve(timeout), 100); }),
+		]);
+		clearTimeout(timer);
+
+		assert.notEqual(bashResult, timeout, "a sibling dispatch must not wait forever after the first tool result");
+		assert.equal(bashResult.isError, true);
+		assert.equal(c.pendingMcpDispatches.length, 0);
+		assert.equal(c.permissionPendingBlocks.some((pending) => pending.block.id === "bash-id"), false);
+		assert.equal(events.filter((event) => event.type === "toolcall_start").length, 1);
+	});
+
+	it("rebinds a dispatch-first handler after the next assistant turn starts", async () => {
+		const { c, events, handler, emit } = setupMcpDispatchHarness();
+		c.turnCoordinator.observeStreamStart("old-id", "read", { path: "old.txt" });
+		c.turnCoordinator.observeDispatch("read", { path: "old.txt" });
+		c.resetTurnState(fakeModel, true);
+
+		const handlerPromise = handler({ path: "new.txt" });
+		emit({ type: "message_start", index: 0, message: {} });
+		emit({
+			type: "content_block_start", index: 0,
+			content_block: { type: "tool_use", id: "new-id", name: "read", input: {} },
+		});
+		emit({ type: "content_block_stop", index: 0 });
+		emit({ type: "message_stop" });
+		await Promise.resolve();
+
+		assert.equal(events.filter((event) => event.type === "toolcall_start").length, 1);
+		assert.equal(events.filter((event) => event.type === "toolcall_end").length, 1);
+		assert.equal(events.filter((event) => event.type === "done").length, 1);
+		await resolvePiResult(c, "new-id", handlerPromise);
+	});
+
+	it("binds a dispatch when mixed stream text is followed by assistant-only tool_use", async () => {
+		const { c, events, handler, emit } = setupMcpDispatchHarness();
+		emit({ type: "message_start", index: 0, message: {} });
+		emit({ type: "content_block_start", index: 0, content_block: { type: "text" } });
+		emit({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "planning" } });
+		emit({ type: "content_block_stop", index: 0 });
+
+		const handlerPromise = handler({ path: "README.md" });
+		await Promise.resolve();
+		assert.equal(c.pendingMcpDispatches.length, 1);
+
+		processAssistantMessage({
+			type: "assistant",
+			message: {
+				content: [
+					{ type: "text", text: "planning" },
+					{ type: "tool_use", id: "assistant-only-id", name: "read", input: { path: "README.md" } },
+				],
+			},
+		}, fakeModel, new Map(), c);
+		await Promise.resolve();
+
+		assert.equal(c.pendingMcpDispatches.length, 0);
+		assert.equal(c.pendingToolCalls.has("assistant-only-id"), true);
+		assert.deepEqual(
+			events.filter((event) => event.type === "toolcall_end").map((event) => event.toolCall.id),
+			["assistant-only-id"],
+		);
+		assert.equal(events.filter((event) => event.type === "done").length, 1);
+		await resolvePiResult(c, "assistant-only-id", handlerPromise);
 	});
 });
 

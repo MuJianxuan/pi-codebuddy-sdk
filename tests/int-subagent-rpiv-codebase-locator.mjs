@@ -14,7 +14,7 @@ import { fileURLToPath } from "node:url";
 import { createRpcHarness } from "./lib/rpc-harness.mjs";
 
 const DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const BRIDGE_MODEL = "codebuddy/hy3-preview-agent-ioa";
+import { BRIDGE_MODEL } from "./lib/model-config.mjs";
 const TEST_TIMEOUT = 240_000;
 const SUBAGENTS_DIR = resolve(DIR, "../pi-subagents");
 const RPIV_LOCATOR_FIXTURE = resolve(DIR, "tests/fixtures/rpiv-pi-v0.6.0-agents/codebase-locator.md");

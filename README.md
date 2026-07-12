@@ -10,8 +10,9 @@ Pi extension that registers **CodeBuddy** as a model provider. You keep using Pi
 - Exposes CodeBuddy models in Pi (`codebuddy/...` in `/model`)
 - Bridges Pi tools to the SDK (Pi still executes tools; CodeBuddy only plans and calls them)
 - Enforces one bridged tool call per assistant turn on the main Provider Path for stability
-- Forwards Pi's system prompt, skills, and project `AGENTS.md` so the model acts as Pi—not as standalone CodeBuddy Code
+- Forwards Pi's effective system prompt and skills so the model acts as Pi—not as standalone CodeBuddy Code; Pi's `-nc` / `--no-context-files` opt-out is respected
 - Supports session resume, compaction, streaming, thinking levels, and images
+- Historical image tool results are represented textually during session rebuild/resume; current-turn user images retain their typed base64/mime data
 - Learns runtime-served context windows over time and keeps Pi's registered model metadata conservatively aligned with observed reality
 - Optional **AskCodebuddy** tool to delegate a focused sub-task to another CodeBuddy call
 
@@ -76,7 +77,7 @@ pi
 /model
 ```
 
-Pick any entry prefixed with `codebuddy/` (for example `codebuddy/hy3-preview-agent-ioa`).
+Pick any entry prefixed with `codebuddy/` (for example `codebuddy/hy3`).
 
 Tools, skills, extensions, `/compact`, and steer behave the same as with other Pi providers.
 
@@ -94,8 +95,13 @@ AskCodebuddy is blocked automatically when the active provider is already `codeb
 
 **Optional.** Defaults work for most users.
 
-File: `~/.pi/agent/codebuddy-sdk.json` (global) or `.pi/codebuddy-sdk.json` (project). Project config overrides global.
+Global file: `~/.pi/agent/codebuddy-sdk.json`
 
+Project file: `.pi/codebuddy-sdk.json`
+
+Global config is loaded when the extension starts. A project config is only read after you choose **Allow and remember** at `session_start`; the decision is stored by canonical project path in `~/.pi/agent/codebuddy-sdk-project-trust.json`. In modes without dialog UI, an unapproved project config is ignored with a warning.
+
+Project `askCodebuddy` and `provider` sections override global values per key. Arrays replace the global array rather than being concatenated. `provider.pathToCodebuddyCode` is global-only: a project value is ignored with a warning even for an approved project. Run `/reload` after changing project config.
 ```json
 {
   "askCodebuddy": {
@@ -131,14 +137,17 @@ These control the main Provider Path (when you pick `codebuddy/...` in `/model`)
 |--------|---------|---------|
 | `provider.appendSystemPrompt` | `true` | Use Pi's system prompt and Pi Tool Bridge guidance instead of CodeBuddy's default identity (**escape hatch** — disabling re-enables CodeBuddy filesystem settings) |
 | `provider.settingSources` | `["user","project"]` | CodeBuddy filesystem settings to load; only used when `appendSystemPrompt=false` (**escape hatch**) |
-| `provider.pathToCodebuddyCode` | auto | Path to `codebuddy` when it is **not** on `PATH` |
+| `provider.pathToCodebuddyCode` | auto | Global-only path to `codebuddy` when it is **not** on `PATH`; project values are ignored |
 
 The main Provider Path always runs with strict MCP enabled, so only the Pi-bridged MCP server is visible to CodeBuddy in provider mode.
+
+The provider registers each model with the conservative calibration `floor`. The cache also records `latest` and `max` observations for diagnostics, but a larger later observation never raises a previously proven floor.
 
 ## Privacy
 
 - The extension does **not** send conversation data to this repository or any third-party telemetry endpoint.
 - Credentials are handled entirely by the CodeBuddy CLI on your machine.
+- AskCodebuddy action summaries store fixed execution verbs such as `Bash`; raw Bash/PowerShell/Terminal commands are not persisted in Pi tool results.
 - Optional debug mode (`CODEBUDDY_SDK_DEBUG=1`) writes **local** logs under `~/.pi/agent/`; paths are redacted, prompts and tool payloads are not logged. Delete logs when finished.
 
 ## Troubleshooting
@@ -149,6 +158,7 @@ export CODEBUDDY_SDK_DEBUG=1
 
 Default log: `~/.pi/agent/codebuddy-sdk.log`. See [CONTRIBUTING.md](CONTRIBUTING.md) for maintainer details.
 Runtime calibration cache: `~/.pi/agent/codebuddy-sdk-model-calibration.json` stores observed model capability floors per runtime environment.
+Project config trust store: `~/.pi/agent/codebuddy-sdk-project-trust.json` records allow/deny decisions by canonical project path. Remove the relevant entry to request confirmation again.
 
 ## Development
 

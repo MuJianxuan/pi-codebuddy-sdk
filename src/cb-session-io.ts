@@ -2,11 +2,11 @@
 // CodeBuddy stores sessions at ~/.codebuddy/projects/<sanitized-path>/<sessionId>.jsonl
 
 import { randomUUID } from "crypto";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { mkdirSync, rmSync, writeFileSync } from "fs";
 import { homedir } from "os";
-import { join } from "path";
+import { isAbsolute, join, relative, resolve, sep } from "path";
 import type { Message as PiMessage } from "@earendil-works/pi-ai";
-import { convertPiMessages, messageContentToText } from "./convert.js";
+import { convertPiMessages } from "./convert.js";
 
 export interface CbMessage {
 	role: "user" | "assistant";
@@ -29,13 +29,43 @@ export function getProjectDir(projectPath: string, codebuddyDir?: string): strin
 	return join(getCodebuddyDir(codebuddyDir), "projects", projectPathToHash(projectPath));
 }
 
+const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_:-]*$/;
+const SESSION_ID_MAX_LENGTH = 256;
+
+export function assertSessionIdSegment(sessionId: string): string {
+	if (
+		typeof sessionId !== "string" ||
+		sessionId.length === 0 ||
+		sessionId.length > SESSION_ID_MAX_LENGTH ||
+		!SESSION_ID_PATTERN.test(sessionId) ||
+		isAbsolute(sessionId)
+	) {
+		throw new Error("Invalid CodeBuddy session id");
+	}
+	return sessionId;
+}
+
+function containedPath(base: string, candidate: string): string {
+	const resolvedBase = resolve(base);
+	const resolvedCandidate = resolve(candidate);
+	const remainder = relative(resolvedBase, resolvedCandidate);
+	if (remainder === "" || remainder === ".." || remainder.startsWith(`..${sep}`) || isAbsolute(remainder)) {
+		throw new Error("Session path escaped its project directory");
+	}
+	return resolvedCandidate;
+}
+
 export function getSessionPath(sessionId: string, projectPath: string, codebuddyDir?: string): string {
-	return join(getProjectDir(projectPath, codebuddyDir), `${sessionId}.jsonl`);
+	assertSessionIdSegment(sessionId);
+	const projectDir = getProjectDir(projectPath, codebuddyDir);
+	return containedPath(projectDir, join(projectDir, `${sessionId}.jsonl`));
 }
 
 export function deleteSession(sessionId: string, projectPath: string, codebuddyDir?: string): void {
+	assertSessionIdSegment(sessionId);
 	const jsonlPath = getSessionPath(sessionId, projectPath, codebuddyDir);
-	const dir = join(getProjectDir(projectPath, codebuddyDir), sessionId);
+	const projectDir = getProjectDir(projectPath, codebuddyDir);
+	const dir = containedPath(projectDir, join(projectDir, sessionId));
 	try { rmSync(jsonlPath, { force: true }); } catch { /* ignore */ }
 	try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
 }
@@ -59,8 +89,8 @@ function piToCbMessages(messages: PiMessage[]): CbMessage[] {
 	return out;
 }
 
-function writeCbJsonl(sessionId: string, cwd: string, messages: CbMessage[]): string {
-	const jsonlPath = getSessionPath(sessionId, cwd);
+function writeCbJsonl(sessionId: string, cwd: string, messages: CbMessage[], codebuddyDir?: string): string {
+	const jsonlPath = getSessionPath(sessionId, cwd, codebuddyDir);
 	mkdirSync(join(jsonlPath, ".."), { recursive: true });
 	const lines: string[] = [];
 	let parentId: string | undefined;
@@ -96,7 +126,7 @@ export class Session {
 	messages: CbMessage[] = [];
 
 	constructor(sessionId: string, projectPath: string, codebuddyDir?: string) {
-		this.sessionId = sessionId;
+		this.sessionId = assertSessionIdSegment(sessionId);
 		this.projectPath = projectPath;
 		this.codebuddyDir = codebuddyDir;
 		this.jsonlPath = getSessionPath(sessionId, projectPath, codebuddyDir);
@@ -107,7 +137,7 @@ export class Session {
 	}
 
 	save(): void {
-		writeCbJsonl(this.sessionId, this.projectPath, this.messages);
+		writeCbJsonl(this.sessionId, this.projectPath, this.messages, this.codebuddyDir);
 	}
 }
 
@@ -121,85 +151,4 @@ export interface CreateSessionOptions {
 export function createSession(opts: CreateSessionOptions): Session {
 	const sessionId = opts.sessionId ?? randomUUID();
 	return new Session(sessionId, opts.projectPath, opts.codebuddyDir);
-}
-
-export function repairToolPairing(messages: Array<{ role: string; content: unknown }>): Array<{ role: string; content: unknown }> {
-	const result: Array<{ role: string; content: unknown }> = [];
-	let pending: Set<string> | null = null;
-	const synthetic = (id: string) => ({
-		type: "tool_result",
-		tool_use_id: id,
-		content: "[no tool result recorded]",
-		is_error: true,
-	});
-	const flushPending = () => {
-		if (pending && pending.size > 0) {
-			result.push({ role: "user", content: [...pending].map(synthetic) });
-		}
-		pending = null;
-	};
-	for (const msg of messages) {
-		if (msg.role === "assistant") {
-			flushPending();
-			const ids = new Set<string>();
-			if (Array.isArray(msg.content)) {
-				for (const b of msg.content as Array<{ type?: string; id?: string }>) {
-					if (b.type === "tool_use" && typeof b.id === "string") ids.add(b.id);
-				}
-			}
-			result.push(msg);
-			pending = ids.size > 0 ? ids : null;
-			continue;
-		}
-		const blocks = Array.isArray(msg.content) ? msg.content as Array<{ type?: string; tool_use_id?: string }> : null;
-		const hasToolResults = blocks?.some((b) => b.type === "tool_result") ?? false;
-		if (!pending && !hasToolResults) {
-			result.push(msg);
-			continue;
-		}
-		const input = blocks ?? (typeof msg.content === "string" && msg.content ? [{ type: "text", text: msg.content }] : []);
-		const provided = new Set<string>();
-		const kept = input.filter((b: { type?: string; tool_use_id?: string }) => {
-			if (b.type !== "tool_result") return true;
-			if (b.tool_use_id && pending?.has(b.tool_use_id)) {
-				provided.add(b.tool_use_id);
-				return true;
-			}
-			return false;
-		});
-		if (pending) {
-			const missing = [...pending].filter((id) => !provided.has(id)).map(synthetic);
-			kept.unshift(...missing);
-			pending = null;
-		}
-		if (kept.length === 0) {
-			if (result.length === 0) {
-				result.push({ role: "user", content: [{ type: "text", text: "[orphaned tool result removed]" }] });
-			}
-			continue;
-		}
-		result.push({ ...msg, content: kept });
-	}
-	flushPending();
-	return result;
-}
-
-export function readSession(sessionId: string, projectPath: string, codebuddyDir?: string): Session | null {
-	const jsonlPath = getSessionPath(sessionId, projectPath, codebuddyDir);
-	if (!existsSync(jsonlPath)) return null;
-	const session = new Session(sessionId, projectPath, codebuddyDir);
-	const lines = readFileSync(jsonlPath, "utf-8").split("\n").filter(Boolean);
-	for (const line of lines) {
-		try {
-			const rec = JSON.parse(line);
-			if (rec.type === "message" && rec.role === "user") {
-				const text = rec.content?.find((b: any) => b.type === "input_text")?.text ?? messageContentToText(rec.content);
-				session.messages.push({ role: "user", content: text });
-			} else if (rec.type === "message" && rec.role === "assistant") {
-				const text = rec.content?.find((b: any) => b.type === "output_text")?.text ?? messageContentToText(rec.content);
-				session.messages.push({ role: "assistant", content: text });
-			}
-		} catch { /* skip malformed */ }
-	}
-	return session;
 }

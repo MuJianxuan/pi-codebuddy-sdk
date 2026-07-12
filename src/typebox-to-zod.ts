@@ -1,200 +1,277 @@
-// TypeBox (JSON Schema) → Zod conversion used by buildMcpServers.
-//
-// Pi tools declare their parameters as TypeBox objects (i.e. JSON Schema at
-// runtime). The Agent SDK's createSdkMcpServer requires Zod — its internal
-// `Z0()` detects Zod via the `~standard` marker or `_def`/`_zod` properties
-// and silently downgrades unrecognized schemas to
-// `{type: "object", properties: {}}`, which leaves the model with no
-// parameter info. This module bridges the two so MCP-exposed pi tools retain
-// their schemas. If this breaks after an SDK update, check whether `Z0()`
-// detection changed or createSdkMcpServer now accepts raw JSON Schema.
+// Narrow JSON Schema/TypeBox -> Zod bridge used by the MCP adapter.
+// Unsupported schema constructs fail explicitly so an extension tool is
+// isolated instead of being silently downgraded to z.unknown().
 
 import { z } from "zod";
 
 type JsonSchema = Record<string, unknown>;
 type JsonLiteral = string | number | boolean | null;
 
-function withDescription(schema: z.ZodTypeAny, prop: JsonSchema): z.ZodTypeAny {
-	if (typeof prop.description === "string") return schema.describe(prop.description);
-	return schema;
+export interface SchemaConversionFailure {
+	path: string;
+	keyword: string;
+	message: string;
+}
+
+export class SchemaConversionError extends Error {
+	readonly failure: SchemaConversionFailure;
+
+	constructor(failure: SchemaConversionFailure) {
+		super(`${failure.path}: unsupported or invalid ${failure.keyword} (${failure.message})`);
+		this.name = "SchemaConversionError";
+		this.failure = failure;
+	}
+}
+
+export interface SafeSchemaConversion {
+	schema?: z.ZodTypeAny;
+	error?: SchemaConversionFailure;
+}
+
+const ALLOWED_KEYWORDS = new Set([
+	"type", "properties", "patternProperties", "required", "additionalProperties", "items",
+	"enum", "const", "oneOf", "anyOf", "allOf", "nullable", "description",
+	"title", "default", "examples", "$schema",
+	"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf",
+	"minLength", "maxLength", "pattern", "minItems", "maxItems", "uniqueItems",
+]);
+
+function isPlainObject(value: unknown): value is JsonSchema {
+	if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+	const prototype = Object.getPrototypeOf(value);
+	return prototype === Object.prototype || prototype === null;
 }
 
 function isJsonLiteral(value: unknown): value is JsonLiteral {
 	return value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean";
 }
 
-function literalSchema(value: unknown): z.ZodTypeAny {
-	if (
-		isJsonLiteral(value)
-	) {
-		return z.literal(value);
-	}
-	return z.unknown();
+function fail(path: string, keyword: string, message: string): never {
+	throw new SchemaConversionError({ path, keyword, message });
 }
 
-function unionSchema(schemas: z.ZodTypeAny[]): z.ZodTypeAny {
-	if (schemas.length === 0) return z.unknown();
+function schemaObject(value: unknown, path: string): JsonSchema {
+	if (!isPlainObject(value)) fail(path, "schema", "expected a plain object");
+	for (const key of Object.keys(value)) {
+		if (!ALLOWED_KEYWORDS.has(key)) fail(path, key, "keyword is outside the supported MCP subset");
+	}
+	return value;
+}
+
+function literalSchema(value: unknown, path: string): z.ZodTypeAny {
+	if (!isJsonLiteral(value)) fail(path, "const/enum", "only JSON literals are supported");
+	return z.literal(value);
+}
+
+function unionSchema(schemas: z.ZodTypeAny[], path: string): z.ZodTypeAny {
+	if (schemas.length === 0) fail(path, "enum/union", "empty unions are unsupported");
 	if (schemas.length === 1) return schemas[0];
 	return z.union(schemas as [z.ZodTypeAny, z.ZodTypeAny, ...z.ZodTypeAny[]]);
 }
 
-function intersectionSchema(schemas: z.ZodTypeAny[]): z.ZodTypeAny {
-	if (schemas.length === 0) return z.unknown();
-	if (schemas.length === 1) return schemas[0];
-	return schemas.slice(1).reduce((left, right) => z.intersection(left, right), schemas[0]);
+function applyValidation(schema: z.ZodTypeAny, prop: JsonSchema, path: string, kind: string): z.ZodTypeAny {
+	let result = schema;
+	const numberSchema = kind === "number" || kind === "integer";
+	if (numberSchema) {
+		if (typeof prop.minimum === "number") result = (result as z.ZodNumber).min(prop.minimum);
+		if (typeof prop.maximum === "number") result = (result as z.ZodNumber).max(prop.maximum);
+		if (typeof prop.exclusiveMinimum === "number") result = (result as z.ZodNumber).gt(prop.exclusiveMinimum);
+		if (typeof prop.exclusiveMaximum === "number") result = (result as z.ZodNumber).lt(prop.exclusiveMaximum);
+		if (typeof prop.multipleOf === "number" && prop.multipleOf > 0) {
+			const multiple = prop.multipleOf;
+			result = result.refine((value) => Math.abs(Number(value) / multiple - Math.round(Number(value) / multiple)) < Number.EPSILON, {
+				message: `must be a multiple of ${multiple}`,
+			});
+		}
+		for (const key of ["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf"]) {
+			if (prop[key] !== undefined && typeof prop[key] !== "number") fail(path, key, "expected a finite number");
+		}
+	}
+	if (kind === "string") {
+		if (typeof prop.minLength === "number") result = (result as z.ZodString).min(prop.minLength);
+		if (typeof prop.maxLength === "number") result = (result as z.ZodString).max(prop.maxLength);
+		if (typeof prop.pattern === "string") {
+			try {
+				result = (result as z.ZodString).regex(new RegExp(prop.pattern));
+			} catch {
+				fail(path, "pattern", "invalid regular expression");
+			}
+		}
+		for (const key of ["minLength", "maxLength"]) {
+			if (prop[key] !== undefined && (typeof prop[key] !== "number" || !Number.isInteger(prop[key]) || prop[key] < 0)) {
+				fail(path, key, "expected a non-negative integer");
+			}
+		}
+	}
+	if (kind === "array") {
+		if (typeof prop.minItems === "number") result = (result as z.ZodArray<any>).min(prop.minItems);
+		if (typeof prop.maxItems === "number") result = (result as z.ZodArray<any>).max(prop.maxItems);
+		if (prop.uniqueItems === true) {
+			result = result.refine((items) => {
+				if (!Array.isArray(items)) return true;
+				const serialized = items.map((item) => JSON.stringify(item));
+				return new Set(serialized).size === serialized.length;
+			}, { message: "items must be unique" });
+		} else if (prop.uniqueItems !== undefined && prop.uniqueItems !== false) {
+			fail(path, "uniqueItems", "expected a boolean");
+		}
+		for (const key of ["minItems", "maxItems"]) {
+			if (prop[key] !== undefined && (typeof prop[key] !== "number" || !Number.isInteger(prop[key]) || prop[key] < 0)) {
+				fail(path, key, "expected a non-negative integer");
+			}
+		}
+	}
+	if (typeof prop.nullable !== "undefined" && typeof prop.nullable !== "boolean") fail(path, "nullable", "expected a boolean");
+	if (prop.nullable === true) result = result.nullable();
+	if (typeof prop.description === "string") result = result.describe(prop.description);
+	return result;
 }
 
-function objectSchema(prop: JsonSchema, relax = false): z.ZodTypeAny {
-	const shape = jsonSchemaToZodShape(prop, relax);
-	const additionalPropertiesSchema =
-		prop.additionalProperties && typeof prop.additionalProperties === "object"
-			? jsonSchemaPropertyToZod(prop.additionalProperties as JsonSchema, relax)
-			: undefined;
-	if (Object.keys(shape).length > 0) {
-		const base = z.object(shape);
-		// relax: never strict — accept {} and extra keys so a CodeBuddy MCP client
-		// that drops parallel tool_call arguments to {} still passes validation.
-		if (!relax && prop.additionalProperties === false) return base.strict();
-		if (additionalPropertiesSchema) return base.catchall(additionalPropertiesSchema);
-		return base.passthrough();
+function objectSchema(prop: JsonSchema, path: string, relax: boolean): z.ZodTypeAny {
+	const shape = jsonSchemaToZodShape(prop, path, relax);
+	const patternProperties = prop.patternProperties;
+	if (patternProperties !== undefined && !isPlainObject(patternProperties)) {
+		fail(`${path}.patternProperties`, "patternProperties", "expected an object of regular expressions to schemas");
 	}
-	if (additionalPropertiesSchema) return z.record(z.string(), additionalPropertiesSchema);
-	if (!relax && prop.additionalProperties === false) return z.object({}).strict();
-	return z.record(z.string(), z.unknown());
+	const patternEntries = Object.entries((patternProperties as JsonSchema | undefined) ?? {});
+	let patternSchema: z.ZodTypeAny | undefined;
+	for (const [pattern, schema] of patternEntries) {
+		try {
+			new RegExp(pattern);
+		} catch {
+			fail(`${path}.patternProperties.${pattern}`, "patternProperties", "invalid regular expression");
+		}
+		if (pattern !== "^.*$" && pattern !== ".*") {
+			fail(`${path}.patternProperties.${pattern}`, "patternProperties", "only catch-all patterns are supported");
+		}
+		if (patternSchema) {
+			fail(`${path}.patternProperties`, "patternProperties", "multiple catch-all patterns are unsupported");
+		}
+		patternSchema = jsonSchemaPropertyToZodInternal(schema, `${path}.patternProperties.${pattern}`, relax);
+	}
+	const additional = prop.additionalProperties;
+	if (additional !== undefined && additional !== true && additional !== false && !isPlainObject(additional)) {
+		fail(`${path}.additionalProperties`, "additionalProperties", "expected boolean or schema");
+	}
+	if (patternSchema && isPlainObject(additional)) {
+		fail(`${path}.additionalProperties`, "additionalProperties", "cannot combine a catch-all pattern with an additional-properties schema");
+	}
+	const additionalSchema = isPlainObject(additional)
+		? jsonSchemaPropertyToZodInternal(additional, `${path}.additionalProperties`, relax)
+		: undefined;
+	const base = z.object(shape);
+	if (patternSchema) return base.catchall(patternSchema);
+	if (relax) return additionalSchema ? base.catchall(additionalSchema) : base.passthrough();
+	if (additional === false) return base.strict();
+	if (additionalSchema) return base.catchall(additionalSchema);
+	if (additional === true || Object.keys(shape).length === 0) return base.passthrough();
+	return base.passthrough();
+}
+
+function jsonSchemaPropertyToZodInternal(propValue: unknown, path: string, relax: boolean): z.ZodTypeAny {
+	const prop = schemaObject(propValue, path);
+	// JSON Schema's empty schema accepts every JSON value. TypeBox emits this
+	// shape for Type.Any(), including values inside Record schemas.
+	if (Object.keys(prop).length === 0) return z.unknown();
+	if (prop.const !== undefined) return applyValidation(literalSchema(prop.const, `${path}.const`), prop, path, "literal");
+	if (prop.enum !== undefined) {
+		if (!Array.isArray(prop.enum) || prop.enum.length === 0) fail(`${path}.enum`, "enum", "enum must contain at least one literal");
+		return applyValidation(unionSchema(prop.enum.map((value, index) => literalSchema(value, `${path}.enum[${index}]`)), path), prop, path, "literal");
+	}
+	for (const keyword of ["oneOf", "anyOf", "allOf"]) {
+		if (prop[keyword] === undefined) continue;
+		if (!Array.isArray(prop[keyword]) || prop[keyword].length === 0) fail(`${path}.${keyword}`, keyword, "expected a non-empty schema array");
+		const parts = prop[keyword].map((part, index) => jsonSchemaPropertyToZodInternal(part, `${path}.${keyword}[${index}]`, relax));
+		const combined = keyword === "allOf"
+			? parts.slice(1).reduce((left, right) => z.intersection(left, right), parts[0])
+			: unionSchema(parts, `${path}.${keyword}`);
+		return applyValidation(combined, prop, path, "union");
+	}
+	if (Array.isArray(prop.type)) {
+		if (prop.type.length === 0 || prop.type.some((value) => typeof value !== "string")) fail(`${path}.type`, "type", "expected non-empty string array");
+		return applyValidation(
+			unionSchema(prop.type.map((type) => jsonSchemaPropertyToZodInternal({ ...prop, type }, path, relax)), path),
+			prop,
+			path,
+			"union",
+		);
+	}
+
+	const type = typeof prop.type === "string"
+		? prop.type
+		: prop.properties !== undefined || prop.patternProperties !== undefined
+			? "object"
+			: undefined;
+	if (!type) fail(path, "type", "schema must declare a supported type");
+	switch (type) {
+		case "string":
+			return applyValidation(z.string(), prop, path, type);
+		case "number":
+			return applyValidation(z.number(), prop, path, type);
+		case "integer":
+			return applyValidation(z.number().int(), prop, path, type);
+		case "boolean":
+			return applyValidation(z.boolean(), prop, path, type);
+		case "null":
+			return applyValidation(z.null(), prop, path, type);
+		case "array": {
+			if (prop.items === undefined) return applyValidation(z.array(z.unknown()), prop, path, type);
+			if (Array.isArray(prop.items)) fail(`${path}.items`, "items", "tuple arrays are unsupported; use a homogeneous items schema");
+			return applyValidation(z.array(jsonSchemaPropertyToZodInternal(prop.items, `${path}.items`, relax)), prop, path, type);
+		}
+		case "object":
+			return applyValidation(objectSchema(prop, path, relax), prop, path, type);
+		default:
+			fail(`${path}.type`, "type", `unsupported type ${JSON.stringify(type)}`);
+	}
 }
 
 export function jsonSchemaPropertyToZod(prop: JsonSchema, relax = false): z.ZodTypeAny {
-	let base: z.ZodTypeAny;
-
-	if (prop.const !== undefined) {
-		base = literalSchema(prop.const);
-		if (prop.nullable === true) base = base.nullable();
-		return withDescription(base, prop);
-	}
-
-	if (Array.isArray(prop.enum)) {
-		base = unionSchema(prop.enum.map((value) => literalSchema(value)));
-		if (prop.nullable === true) base = base.nullable();
-		return withDescription(base, prop);
-	}
-
-	if (Array.isArray(prop.oneOf)) {
-		base = unionSchema(prop.oneOf.map((item) => jsonSchemaPropertyToZod(item as JsonSchema)));
-		if (prop.nullable === true) base = base.nullable();
-		return withDescription(base, prop);
-	}
-
-	if (Array.isArray(prop.anyOf)) {
-		base = unionSchema(prop.anyOf.map((item) => jsonSchemaPropertyToZod(item as JsonSchema)));
-		if (prop.nullable === true) base = base.nullable();
-		return withDescription(base, prop);
-	}
-
-	if (Array.isArray(prop.allOf)) {
-		base = intersectionSchema(prop.allOf.map((item) => jsonSchemaPropertyToZod(item as JsonSchema)));
-		if (prop.nullable === true) base = base.nullable();
-		return withDescription(base, prop);
-	}
-
-	if (Array.isArray(prop.type)) {
-		const allowsNull = prop.type.includes("null");
-		const schemas = prop.type
-			.filter((value): value is string => typeof value === "string" && value !== "null")
-			.map((value) => jsonSchemaPropertyToZod({ ...prop, type: value, nullable: false }));
-		base = unionSchema(schemas);
-		base = allowsNull ? base.nullable() : base;
-		return withDescription(base, prop);
-	}
-
-	const propType = typeof prop.type === "string" ? prop.type : undefined;
-	switch (propType) {
-		case "string":
-			base = z.string();
-			break;
-		case "number":
-		case "integer":
-			base = z.number();
-			break;
-		case "boolean":
-			base = z.boolean();
-			break;
-		case "array":
-			base = prop.items
-				? z.array(jsonSchemaPropertyToZod(prop.items as JsonSchema))
-				: z.array(z.unknown());
-			break;
-		case "object":
-			base = objectSchema(prop, relax);
-			break;
-		case "null":
-			base = z.null();
-			break;
-		default:
-			if (prop.properties) base = objectSchema(prop);
-			else base = z.unknown();
-	}
-
-	if (prop.nullable === true) base = base.nullable();
-	return withDescription(base, prop);
+	return jsonSchemaPropertyToZodInternal(prop, "$", relax);
 }
 
-export function jsonSchemaToZodShape(schema: unknown, relax = false): Record<string, z.ZodTypeAny> {
-	const s = schema as JsonSchema;
-	const objectSchemas = [s, ...(Array.isArray(s?.allOf) ? s.allOf as JsonSchema[] : [])]
-		.filter((item) => item && typeof item === "object" && ((item as JsonSchema).type === "object" || (item as JsonSchema).properties));
-	if (objectSchemas.length === 0) return {};
-
+export function jsonSchemaToZodShape(schema: unknown, relax?: boolean): Record<string, z.ZodTypeAny>;
+export function jsonSchemaToZodShape(schema: unknown, path: string, relax?: boolean): Record<string, z.ZodTypeAny>;
+export function jsonSchemaToZodShape(schema: unknown, pathOrRelax: string | boolean = "$", relax = false): Record<string, z.ZodTypeAny> {
+	const path = typeof pathOrRelax === "string" ? pathOrRelax : "$";
+	const actualRelax = typeof pathOrRelax === "boolean" ? pathOrRelax : relax;
+	const s = schemaObject(schema, path);
+	const parts: JsonSchema[] = [s];
+	if (s.allOf !== undefined) {
+		if (!Array.isArray(s.allOf)) fail(`${path}.allOf`, "allOf", "expected an array");
+		for (const [index, part] of s.allOf.entries()) parts.push(schemaObject(part, `${path}.allOf[${index}]`));
+	}
 	const shape: Record<string, z.ZodTypeAny> = {};
-	for (const objectSchemaPart of objectSchemas) {
-		const props = objectSchemaPart.properties as Record<string, JsonSchema> | undefined;
-		if (!props) continue;
-		const required = new Set(Array.isArray(objectSchemaPart.required) ? objectSchemaPart.required as string[] : []);
-		for (const [key, prop] of Object.entries(props)) {
-			const zodProp = jsonSchemaPropertyToZod(prop, relax);
-			// relax: make every property optional so an empty {} (args dropped by a
-			// buggy parallel tool_call dispatch) still validates. Descriptions are
-			// preserved so the model keeps parameter guidance.
-			shape[key] = relax || !required.has(key) ? zodProp.optional() : zodProp;
+	for (const [partIndex, part] of parts.entries()) {
+		if (part.properties === undefined) continue;
+		if (!isPlainObject(part.properties)) fail(`${path}${partIndex === 0 ? "" : `.allOf[${partIndex - 1}]`}.properties`, "properties", "expected an object");
+		const requiredValue = part.required;
+		if (requiredValue !== undefined && (!Array.isArray(requiredValue) || requiredValue.some((key) => typeof key !== "string"))) {
+			fail(`${path}.required`, "required", "expected an array of property names");
+		}
+		const required = new Set((requiredValue as string[] | undefined) ?? []);
+		for (const [key, prop] of Object.entries(part.properties)) {
+			const converted = jsonSchemaPropertyToZodInternal(prop, `${path}.properties.${key}`, actualRelax);
+			shape[key] = actualRelax || !required.has(key) ? converted.optional() : converted;
 		}
 	}
 	return shape;
 }
 
 export function jsonSchemaToZodObject(schema: unknown, relax = false): z.ZodTypeAny {
-	return jsonSchemaPropertyToZod(schema as JsonSchema, relax);
+	return jsonSchemaPropertyToZodInternal(schema, "$", relax);
 }
 
-/**
- * MCP-specific schema builder: preserves required field constraints so that
- * an empty {} (from a buggy parallel tool_call dispatch) is rejected by MCP
- * validation, while still allowing extra keys (passthrough) for forward-compat.
- *
- * Unlike jsonSchemaToZodObject(relax=true) which makes ALL params optional,
- * this keeps required params required. This forces CodeBuddy to regenerate
- * proper args instead of silently passing {} through to the handler.
- *
- * The deferred-backfill logic in processStreamEvent/processAssistantMessage
- * handles the case where stream args arrive empty — it waits for the
- * assistant message or MCP dispatch to provide real args. So MCP validation
- * rejecting {} is safe and desirable: it's an early signal that args were
- * dropped, rather than letting an empty-args call reach pi.
- */
-export function jsonSchemaToZodObjectForMcp(schema: unknown): z.ZodTypeAny {
-	const s = schema as JsonSchema;
-	// Build shape with relax=false to preserve required constraints
-	const shape = jsonSchemaToZodShape(s, false);
-	const additionalPropertiesSchema =
-		s?.additionalProperties && typeof s.additionalProperties === "object"
-			? jsonSchemaPropertyToZod(s.additionalProperties as JsonSchema, false)
-			: undefined;
-
-	if (Object.keys(shape).length > 0) {
-		const base = z.object(shape);
-		// Always passthrough: accept extra keys (forward-compat with new params)
-		// but enforce required fields.
-		if (additionalPropertiesSchema) return base.catchall(additionalPropertiesSchema);
-		return base.passthrough();
+export function tryJsonSchemaToZodObjectForMcp(schema: unknown): SafeSchemaConversion {
+	try {
+		return { schema: jsonSchemaToZodObjectForMcp(schema) };
+	} catch (error) {
+		if (error instanceof SchemaConversionError) return { error: error.failure };
+		return { error: { path: "$", keyword: "schema", message: error instanceof Error ? error.message : String(error) } };
 	}
-	if (s?.additionalProperties === false) return z.object({}).strict();
-	return z.record(z.string(), z.unknown());
+}
+
+export function jsonSchemaToZodObjectForMcp(schema: unknown): z.ZodTypeAny {
+	const value = schemaObject(schema, "$");
+	return jsonSchemaPropertyToZodInternal(value, "$", false);
 }

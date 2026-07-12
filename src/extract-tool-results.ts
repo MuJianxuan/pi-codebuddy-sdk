@@ -26,6 +26,7 @@ export function toolResultToMcpContent(
 	for (const block of content) {
 		if (block.type === "text" && block.text) blocks.push({ type: "text", text: block.text });
 		else if (block.type === "image" && block.data && block.mimeType) blocks.push({ type: "image", data: block.data, mimeType: block.mimeType });
+		else if (block.type === "image") blocks.push({ type: "text", text: "[invalid image omitted]" });
 	}
 	return blocks.length ? blocks : [{ type: "text", text: "" }];
 }

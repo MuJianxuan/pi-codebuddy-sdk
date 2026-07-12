@@ -22,17 +22,17 @@ Follow user rules.`;
 
 describe("buildCodebuddySystemPrompt", () => {
 	it("includes Pi Tool Bridge instructions", () => {
-		const result = buildCodebuddySystemPrompt(PI_PROMPT, { includeAgents: false });
+		const availableToolNames = ["read", "edit", "write", "bash"];
+		const result = buildCodebuddySystemPrompt(PI_PROMPT, { availableToolNames });
 		assert.ok(result?.includes("Pi Tool Bridge:"));
 		assert.ok(result?.includes("mcp__custom_tools__read"));
 		assert.ok(result?.includes("Use `mcp__custom_tools__read`"));
 		assert.ok(result?.includes("oldText/old_string value must exactly match"));
-		assert.ok(result?.startsWith(buildPiToolBridgeInstruction()));
+		assert.ok(result?.startsWith(buildPiToolBridgeInstruction({ availableToolNames })));
 	});
 
 	it("adapts tool bridge instructions to available tools", () => {
 		const result = buildCodebuddySystemPrompt(PI_PROMPT, {
-			includeAgents: false,
 			availableToolNames: ["read", "bash"],
 		});
 		assert.ok(result?.includes("`mcp__custom_tools__read`, `mcp__custom_tools__bash`"));
@@ -44,7 +44,6 @@ describe("buildCodebuddySystemPrompt", () => {
 
 	it("defaults to serial tool-call enforcement when multiple tools available", () => {
 		const result = buildCodebuddySystemPrompt(PI_PROMPT, {
-			includeAgents: false,
 			availableToolNames: ["read", "bash"],
 		});
 		assert.ok(result?.includes("AT MOST ONE tool per turn"));
@@ -54,7 +53,6 @@ describe("buildCodebuddySystemPrompt", () => {
 
 	it("does not include parallel tool-call guidance when only one tool available", () => {
 		const result = buildCodebuddySystemPrompt(PI_PROMPT, {
-			includeAgents: false,
 			availableToolNames: ["read"],
 		});
 		assert.ok(result?.includes("AT MOST ONE tool per turn"));
@@ -63,7 +61,6 @@ describe("buildCodebuddySystemPrompt", () => {
 
 	it("does not inject provider tool guidance when disabled", () => {
 		const result = buildCodebuddySystemPrompt(PI_PROMPT, {
-			includeAgents: false,
 			includeToolBridge: false,
 		});
 		assert.ok(result?.includes("You are Pi's coding assistant"));
@@ -73,29 +70,33 @@ describe("buildCodebuddySystemPrompt", () => {
 	});
 
 	it("uses Pi identity instead of CodeBuddy default", () => {
-		const result = buildCodebuddySystemPrompt(PI_PROMPT, { includeAgents: false });
+		const result = buildCodebuddySystemPrompt(PI_PROMPT, { availableToolNames: ["read", "edit", "write", "bash"] });
 		assert.ok(result?.includes("You are Pi's coding assistant"));
 		assert.ok(result?.includes("mcp__custom_tools__read"));
 		assert.ok(!result?.includes("CodeBuddy Code"));
 	});
 
 	it("rewrites skills read tool inside full prompt", () => {
-		const result = buildCodebuddySystemPrompt(PI_PROMPT, { includeAgents: false });
+		const result = buildCodebuddySystemPrompt(PI_PROMPT, { availableToolNames: ["read", "edit", "write", "bash"] });
 		assert.ok(result?.includes("Use the read tool (mcp__custom_tools__read)"));
 		assert.ok(!result?.includes("Use the read tool to load a skill's file\n"));
 	});
 
 	it("includeSkills=false strips skills block", () => {
-		const result = buildCodebuddySystemPrompt(PI_PROMPT, { includeAgents: false, includeSkills: false });
+		const result = buildCodebuddySystemPrompt(PI_PROMPT, { availableToolNames: ["read", "edit", "write", "bash"], includeSkills: false });
 		assert.ok(result?.includes("You are Pi's coding assistant"));
 		assert.ok(!result?.includes("<available_skills>"));
 	});
 
-	it("undefined prompt with includeAgents=false → undefined", () => {
-		assert.strictEqual(buildCodebuddySystemPrompt(undefined, { includeAgents: false }), buildPiToolBridgeInstruction());
+	it("undefined prompt with no context → bridge only", () => {
+		const availableToolNames = ["read", "edit", "write", "bash"];
+		assert.strictEqual(
+			buildCodebuddySystemPrompt(undefined, { availableToolNames }),
+			buildPiToolBridgeInstruction({ availableToolNames }),
+		);
 	});
 
 	it("undefined prompt with tool bridge disabled → undefined", () => {
-		assert.strictEqual(buildCodebuddySystemPrompt(undefined, { includeAgents: false, includeToolBridge: false }), undefined);
+		assert.strictEqual(buildCodebuddySystemPrompt(undefined, { includeToolBridge: false }), undefined);
 	});
 });

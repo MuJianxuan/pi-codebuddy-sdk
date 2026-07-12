@@ -1,49 +1,12 @@
 /**
- * Tests for session integrity helpers:
- *   - repairToolPairing (from cb-session-io): pairs orphan tool_use blocks
- *     with synthetic tool_result so imported history never starts mid-turn.
- *   - verifyWrittenSession (from session-verify.js): warns if the JSONL file
- *     doesn't round-trip (missing file, record-count mismatch, sessionId drift).
+ * Tests for verifyWrittenSession (from session-verify.js): warns if the JSONL
+ * doesn't round-trip (missing file, record-count mismatch, sessionId drift).
  */
 import { describe, it, after } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { repairToolPairing } from "../src/cb-session-io.js";
 import { verifyWrittenSession } from "../src/session-verify.js";
-
-// --- repairToolPairing ---
-
-describe("repairToolPairing", () => {
-	it("passes through a paired tool_use/tool_result", () => {
-		const msgs = [
-			{ role: "assistant", content: [{ type: "tool_use", id: "t1", name: "X", input: {} }] },
-			{ role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }] },
-		];
-		const repaired = repairToolPairing(msgs);
-		assert.equal(repaired.length, msgs.length);
-	});
-
-	it("synthesizes a tool_result for an orphan tool_use", () => {
-		const msgs = [
-			{ role: "assistant", content: [{ type: "tool_use", id: "orphan", name: "X", input: {} }] },
-			{ role: "user", content: "next turn" },
-		];
-		const repaired = repairToolPairing(msgs);
-		// Prepends a synthetic tool_result block to the next user message (in-place, same count).
-		assert.equal(repaired.length, msgs.length);
-		const nextUser = repaired[1];
-		assert.equal(nextUser.role, "user");
-		assert.ok(Array.isArray(nextUser.content));
-		assert.equal(nextUser.content[0].type, "tool_result");
-		assert.equal(nextUser.content[0].tool_use_id, "orphan");
-		assert.equal(nextUser.content[0].is_error, true);
-	});
-
-	it("empty input returns empty", () => {
-		assert.deepEqual(repairToolPairing([]), []);
-	});
-});
 
 describe("verifyWrittenSession", () => {
 	const dir = mkdtempSync("/tmp/verify-session-");
@@ -83,5 +46,21 @@ describe("verifyWrittenSession", () => {
 		const warnings = verifyWrittenSession(path, SID, 1);
 		assert.equal(warnings.length, 1);
 		assert.match(warnings[0], /malformed JSONL/);
+	});
+
+	it("checks malformed and drifting middle lines instead of only endpoints", () => {
+		writeFileSync(path, [rec(SID, 0), "not json", rec("different-sid", 2)].join("\n") + "\n");
+		const warnings = verifyWrittenSession(path, SID, 3);
+		assert.equal(warnings.filter((warning) => warning.includes("malformed JSONL")).length, 1);
+		assert.equal(warnings.filter((warning) => warning.includes("sessionId drift")).length, 1);
+	});
+
+	it("reports UTF-8 bytes for multibyte content", () => {
+		const content = `${JSON.stringify({ sessionId: SID, text: "中文" })}\n`;
+		writeFileSync(path, content);
+		const warnings = verifyWrittenSession(path, SID, 2);
+		const mismatch = warnings.find((warning) => warning.includes("record count mismatch"));
+		assert.match(mismatch, /bytes=\d+/);
+		assert.equal(Number(mismatch.match(/bytes=(\d+)/)[1]), Buffer.byteLength(content, "utf8"));
 	});
 });

@@ -5,34 +5,45 @@
 import { statSync, readFileSync } from "fs";
 
 export function verifyWrittenSession(jsonlPath: string, expectedSessionId: string, expectedRecordCount: number): string[] {
-	const warnings = [];
-	let st;
+	const warnings: string[] = [];
+	let st: { size: number };
 	try {
 		st = statSync(jsonlPath);
 	} catch (e) {
-		warnings.push(`file missing after save — path=${jsonlPath} err=${e.message}`);
+		warnings.push(`file missing after save — path=${jsonlPath} err=${errorMessage(e)}`);
 		return warnings;
 	}
-	let content;
+	let content: string;
 	try {
 		content = readFileSync(jsonlPath, "utf8");
 	} catch (e) {
-		warnings.push(`file unreadable — path=${jsonlPath} size=${st.size} err=${e.message}`);
+		warnings.push(`file unreadable — path=${jsonlPath} size=${st.size} err=${errorMessage(e)}`);
 		return warnings;
 	}
 	const lines = content.split("\n").filter((l) => l.trim().length > 0);
 	if (lines.length !== expectedRecordCount) {
-		warnings.push(`record count mismatch — expected=${expectedRecordCount} actual=${lines.length} path=${jsonlPath} bytes=${content.length}`);
-		return warnings;
+		warnings.push(`record count mismatch — expected=${expectedRecordCount} actual=${lines.length} path=${jsonlPath} bytes=${Buffer.byteLength(content, "utf8")}`);
 	}
-	try {
-		const firstRec = JSON.parse(lines[0]);
-		const lastRec = JSON.parse(lines[lines.length - 1]);
-		if (firstRec.sessionId !== expectedSessionId || lastRec.sessionId !== expectedSessionId) {
-			warnings.push(`sessionId drift — expected=${expectedSessionId} first=${firstRec.sessionId} last=${lastRec.sessionId}`);
+	let malformed = false;
+	const sessionIds = new Set<unknown>();
+	for (let index = 0; index < lines.length; index++) {
+		try {
+			const record = JSON.parse(lines[index]) as { sessionId?: unknown };
+			sessionIds.add(record.sessionId);
+			if (record.sessionId !== expectedSessionId) {
+				warnings.push(`sessionId drift — expected=${expectedSessionId} line=${index + 1} actual=${String(record.sessionId)}`);
+			}
+		} catch (e) {
+			malformed = true;
+			warnings.push(`malformed JSONL — path=${jsonlPath} line=${index + 1} err=${errorMessage(e)}`);
 		}
-	} catch (e) {
-		warnings.push(`malformed JSONL — path=${jsonlPath} err=${e.message}`);
 	}
+	if (malformed && sessionIds.size === 0) return warnings;
 	return warnings;
+}
+
+function errorMessage(error: unknown): string {
+	if (error instanceof Error) return error.message;
+	if (error && typeof error === "object" && "message" in error && typeof error.message === "string") return error.message;
+	return String(error);
 }

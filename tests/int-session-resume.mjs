@@ -22,7 +22,7 @@ const OTHER_PROVIDER = requireEnv("CODEBUDDY_SDK_TESTING_ALT_PROVIDER");
 const OTHER_MODEL = requireEnv("CODEBUDDY_SDK_TESTING_ALT_MODEL");
 
 const TIMEOUT = 180_000;
-const BRIDGE_MODEL = "codebuddy/hy3-preview-agent-ioa";
+import { BRIDGE_MODEL } from "./lib/model-config.mjs";
 
 // Random words to avoid Claude memorizing test values across runs
 const WORD_A = `alpha${Math.random().toString(36).slice(2, 6)}`;
@@ -202,4 +202,3 @@ try {
     rmSync(TEST_CWD, { recursive: true, force: true });
   }
 }
-

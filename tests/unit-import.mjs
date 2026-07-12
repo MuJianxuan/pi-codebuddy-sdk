@@ -247,6 +247,12 @@ describe("message structure", () => {
 		assert.equal(convert([{ role: "user", content: [{ type: "text", text: "" }] }])[0].content, "[image]");
 	});
 
+	it("user with malformed image gets an explicit placeholder", () => {
+		assert.deepEqual(convert([{ role: "user", content: [{ type: "image", data: "", mimeType: "image/png" }] }])[0].content, [
+			{ type: "text", text: "[invalid image omitted]" },
+		]);
+	});
+
 	it("tool name mapping: pi names → SDK names", () => {
 		const msgs = [
 			{ role: "assistant", content: [

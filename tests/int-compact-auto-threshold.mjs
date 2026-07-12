@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRpcHarness } from "./lib/rpc-harness.mjs";
 
-const BRIDGE_MODEL = "codebuddy/hy3-preview-agent-ioa";
+import { BRIDGE_MODEL } from "./lib/model-config.mjs";
 const COMPACT_TIMEOUT = 120_000;
 const TEST_TIMEOUT = 240_000;
 

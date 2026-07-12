@@ -71,4 +71,31 @@ describe("provider query boundary options", () => {
 		assert.equal(options.pathToCodebuddyCode, "/opt/codebuddy");
 		assert.equal(options.effort, "high");
 	});
+
+	it("builds model discovery options from the global executable only", () => {
+		const options = __test.buildModelDiscoveryOptions(
+			{ pathToCodebuddyCode: "/global/codebuddy" },
+			"/runtime/project",
+		);
+		assert.equal(options.pathToCodebuddyCode, "/global/codebuddy");
+		assert.equal(options.cwd, "/runtime/project");
+		assert.deepEqual(options.tools, []);
+		assert.deepEqual(options.settingSources, []);
+		assert.equal(options.permissionMode, "bypassPermissions");
+	});
+
+	it("excludes every active Ask alias for the invocation cwd", () => {
+		const tool = (name) => ({
+			name,
+			description: `${name} description`,
+			parameters: { type: "object", properties: {} },
+		});
+		const result = __test.resolveMcpTools({
+			tools: [tool("AskA"), tool("read"), tool("AskB")],
+		}, new Set(["AskA", "AskB"]));
+
+		assert.deepEqual(result.mcpTools.map((entry) => entry.name), ["read"]);
+		assert.equal(result.customToolNameToSdk.has("AskA"), false);
+		assert.equal(result.customToolNameToSdk.has("AskB"), false);
+	});
 });

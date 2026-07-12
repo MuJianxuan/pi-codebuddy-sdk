@@ -116,8 +116,16 @@ describe("buildPiToolBridgeInstruction", () => {
 
 	it("does not copy active tool descriptions into bridge guidance", () => {
 		const description = "THIS_SINGLE_TOOL_DESCRIPTION_SHOULD_NOT_APPEAR";
-		const result = buildPiToolBridgeInstruction({ availableToolNames: ["read", description] });
+		const result = buildPiToolBridgeInstruction({ availableToolNames: ["read", "DeployPreview"] });
 		assert.ok(result.includes("mcp__custom_tools__read"));
 		assert.ok(!result.includes(description));
+		assert.ok(result.includes("mcp__custom_tools__DeployPreview"));
+	});
+
+	it("preserves original custom tool case in MCP names", () => {
+		const result = buildPiToolBridgeInstruction({ availableToolNames: ["Read", "DeployPreview"] });
+		assert.ok(result.includes("mcp__custom_tools__Read"));
+		assert.ok(result.includes("mcp__custom_tools__DeployPreview"));
+		assert.ok(!result.includes("mcp__custom_tools__read"));
 	});
 });

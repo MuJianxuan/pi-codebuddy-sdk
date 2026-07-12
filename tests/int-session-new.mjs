@@ -11,7 +11,7 @@ import { readFileSync } from "node:fs";
 import { createRpcHarness } from "./lib/rpc-harness.mjs";
 
 const TIMEOUT = 180_000;
-const BRIDGE_MODEL = "codebuddy/hy3-preview-agent-ioa";
+import { BRIDGE_MODEL } from "./lib/model-config.mjs";
 
 const harness = createRpcHarness({
 	name: "session-new",

@@ -6,6 +6,7 @@ import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
 import { createSession, deleteSession } from "./cb-session-io.js";
 import { appendFileSync, mkdirSync, realpathSync, statSync } from "fs";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { homedir } from "os";
 import { dirname, join } from "path";
 import { PROVIDER_ID, messageContentToText, convertPiMessages } from "./convert.js";
@@ -13,20 +14,47 @@ import { buildModels, codebuddyModelId, FALLBACK_MODELS, rawModelsFromSdk, rawMo
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, buildCodebuddySystemPrompt, enhancePiToolForCodebuddy } from "./skills.js";
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
-import { QueryContext, ctx } from "./query-state.js";
-import { loadConfig, type Config } from "./config.js";
-import { jsonSchemaToZodObjectForMcp } from "./typebox-to-zod.js";
+import {
+	QueryContext,
+	createQueryRuntimeScope,
+	ctx,
+	runWithQueryRuntimeScope,
+	type PendingMcpDispatch,
+	type QueryRuntimeScope,
+} from "./query-state.js";
+import { loadGlobalConfig, type Config } from "./config.js";
+import { tryJsonSchemaToZodObjectForMcp } from "./typebox-to-zod.js";
 import { buildActionSummary, type ToolCallState } from "./askcodebuddy-ui.js";
 import {
 	applyContextWindowCalibrations,
 	buildCalibrationEnvironment,
+	buildCalibrationKey,
+	DEFAULT_CALIBRATION_CACHE_PATH,
 	loadCalibrationCache,
-	recordObservedContextWindow,
-	saveCalibrationCache,
+	mergeCalibrationCaches,
+	mergeContextWindowMetric,
+	getCalibrationRecord,
+	updateObservedContextWindow,
 	type CalibrationCache,
+	type CapabilityMetric,
 	type CalibrationEnvironment,
 } from "./model-calibration.js";
 import { withSdkGate } from "./sdk-gate.js";
+import {
+	buildAskQueryOptions,
+	consumeAskQuery,
+	type AskMode,
+} from "./askcodebuddy-runner.js";
+import { ToolTurnCoordinator } from "./tool-turn-coordinator.js";
+import { createRuntimeConfigController, type RuntimeConfigSnapshot } from "./runtime-config-controller.js";
+import {
+	getGlobalProviderDispatcher,
+	getGlobalRuntimeConfigRegistry,
+	getProviderInvocationRoute,
+	withProviderInvocationRoute,
+	type RuntimeConfigRegistry,
+	type RuntimeProviderStream,
+} from "./runtime-config-registry.js";
 
 // Compat (#2): use factory if available (pi-ai ≥0.66), else fall back to constructor (gsd-pi etc.)
 const _piAi = piAi as any;
@@ -74,6 +102,7 @@ if (DEBUG) {
 
 // Unique per module evaluation — confirms whether subagents share module state
 const moduleInstanceId = Math.random().toString(36).slice(2, 8);
+let nextRuntimeOwnerId = 1;
 
 function debug(...args: unknown[]) {
 	if (!DEBUG) return;
@@ -113,38 +142,100 @@ function diagDump(label: string, data: Record<string, unknown>) {
 
 // --- Constants ---
 
-// Global key to prevent re-registration of the provider across module reloads.
-//
-// Extensions like pi-subagents spawn a subagent and it loads this module
-// again. Without this guard, the subagent's call to registerProvider() would
-// overwrite the parent's `streamSimple` function reference in the shared
-// ModelRegistry. When the parent later delivers a tool result, it would call
-// the subagent's `streamSimple` (which has empty state) instead of its own.
-//
-// By storing the active streamSimple in a Symbol.for() global (shared across all
-// module instances), we ensure only the FIRST instance to register takes effect.
-// Subsequent instances wrap the stored function instead of overwriting it.
-//
-// On session_shutdown (including /reload), clearSession() resets this so a fresh
-// registration can occur for the next session.
-const ACTIVE_STREAM_SIMPLE_KEY = Symbol.for("codebuddy-sdk:activeStreamSimple");
+// Process-wide provider state is shared across cached factories and re-evaluated
+// module instances. Every active ExtensionRunner owns its Pi registration, while
+// discovery/calibration results are fanned out to all runners.
+const PROVIDER_PROCESS_STATE_KEY = Symbol.for("codebuddy-sdk:provider-process-state:v6");
+
+interface ProviderRuntimeState {
+	sharedSession: SessionState | null;
+	piUI: ExtensionUIContext | null;
+	activeQueryContexts: Set<QueryContext>;
+	queryScope: QueryRuntimeScope;
+}
+
+const defaultProviderRuntimeState: ProviderRuntimeState = {
+	sharedSession: null,
+	piUI: null,
+	activeQueryContexts: new Set(),
+	queryScope: createQueryRuntimeScope(),
+};
+const providerRuntimeStorage = new AsyncLocalStorage<ProviderRuntimeState>();
+
+function createProviderRuntimeState(): ProviderRuntimeState {
+	return {
+		sharedSession: null,
+		piUI: null,
+		activeQueryContexts: new Set(),
+		queryScope: createQueryRuntimeScope(),
+	};
+}
+
+function currentProviderRuntimeState(): ProviderRuntimeState {
+	return providerRuntimeStorage.getStore() ?? defaultProviderRuntimeState;
+}
+
+function runWithProviderRuntimeState<T>(state: ProviderRuntimeState, callback: () => T): T {
+	return providerRuntimeStorage.run(
+		state,
+		() => runWithQueryRuntimeScope(state.queryScope, callback),
+	);
+}
+
+interface ActiveProviderRunner {
+	pi: ExtensionAPI;
+	dispatcher: RuntimeProviderStream;
+	runtimeState: ProviderRuntimeState;
+	runModelDiscovery: ModelDiscovery;
+}
+
+interface PendingCalibrationObservation {
+	modelId: string;
+	environment: CalibrationEnvironment;
+	metric: CapabilityMetric;
+}
+
+interface ProviderProcessState {
+	runners: Map<string, ActiveProviderRunner>;
+	models?: PiModel[];
+	calibrationCache?: CalibrationCache;
+	pendingCalibrationObservations: Map<string, PendingCalibrationObservation>;
+	calibrationTransactions: Map<string, Promise<void>>;
+	calibrationRefreshPending: boolean;
+	discoveryPromise?: Promise<void>;
+	discoveryIsSurvivorRestart: boolean;
+	generation: number;
+}
+
+function getProviderProcessState(): ProviderProcessState {
+	const globals = globalThis as Record<symbol, ProviderProcessState | undefined>;
+	globals[PROVIDER_PROCESS_STATE_KEY] ??= {
+		runners: new Map(),
+		pendingCalibrationObservations: new Map(),
+		calibrationTransactions: new Map(),
+		calibrationRefreshPending: false,
+		discoveryIsSurvivorRestart: false,
+		generation: 0,
+	};
+	return globals[PROVIDER_PROCESS_STATE_KEY];
+}
 
 const SDK_TO_PI_TOOL_NAME: Record<string, string> = {
 	read: "read", write: "write", edit: "edit", bash: "bash",
 };
 
 let MODELS: PiModel[] = buildModels(FALLBACK_MODELS);
-let providerSettings: NonNullable<Config["provider"]> = {};
+let globalProviderSettings: NonNullable<Config["provider"]> = {};
 let calibrationEnvironment: CalibrationEnvironment = buildCalibrationEnvironment();
 let calibrationCache: CalibrationCache = loadCalibrationCache();
-let calibrationRefreshPending = false;
-
 type ContentBlockParam =
 	| { type: "text"; text: string }
 	| { type: "image"; source: { type: "base64"; media_type: string; data: string } };
 type SettingSource = "user" | "project" | "local";
 
 function resolveModel(input: string) {
+	const sharedModels = getProviderProcessState().models;
+	if (sharedModels) MODELS = sharedModels;
 	return _resolveModel(MODELS, input);
 }
 
@@ -152,38 +243,52 @@ function applyModelCalibrations(models: PiModel[]): PiModel[] {
 	return buildModels(applyContextWindowCalibrations(models, calibrationCache, calibrationEnvironment));
 }
 
-function registerCurrentProvider(pi: ExtensionAPI): void {
-	const g = globalThis as Record<symbol, any>;
-	const streamFn = g[ACTIVE_STREAM_SIMPLE_KEY] ?? streamCodebuddySdk;
+function registerCurrentProvider(
+	pi: ExtensionAPI,
+	streamFn: RuntimeProviderStream = getGlobalProviderDispatcher(),
+	models: PiModel[] = MODELS,
+): void {
 	pi.registerProvider(PROVIDER_ID, {
 		name: "CodeBuddy",
 		baseUrl: PROVIDER_ID,
 		apiKey: "not-used",
 		api: "codebuddy-sdk",
-		models: MODELS as any,
+		models: models as any,
 		streamSimple: streamFn as any,
 	});
 }
 
+function fanOutProviderRegistration(models: PiModel[], reason: string): void {
+	const processState = getProviderProcessState();
+	processState.models = models;
+	for (const runner of processState.runners.values()) {
+		try {
+			registerCurrentProvider(runner.pi, runner.dispatcher, models);
+		} catch (error) {
+			debug(`provider fan-out failed (${reason})`, error);
+		}
+	}
+}
+
 function scheduleCalibrationRefresh(reason: string): void {
-	calibrationRefreshPending = true;
+	getProviderProcessState().calibrationRefreshPending = true;
 	debug(`calibration: scheduled provider refresh (${reason})`);
 	queueMicrotask(() => maybeRefreshProviderRegistration(`microtask:${reason}`));
 }
 
 function maybeRefreshProviderRegistration(reason: string): void {
-	if (!calibrationRefreshPending || !piApi) return;
-	if (activeQueryContexts.size > 0) {
-		debug(`calibration: refresh deferred (${reason}) activeQueries=${activeQueryContexts.size}`);
+	const processState = getProviderProcessState();
+	if (!processState.calibrationRefreshPending) return;
+	const activeQueryCount = [...processState.runners.values()]
+		.reduce((count, runner) => count + runner.runtimeState.activeQueryContexts.size, 0);
+	if (activeQueryCount > 0) {
+		debug(`calibration: refresh deferred (${reason}) activeQueries=${activeQueryCount}`);
 		return;
 	}
-	calibrationRefreshPending = false;
-	try {
-		debug(`calibration: refreshing provider registration (${reason}) models=${MODELS.length}`);
-		registerCurrentProvider(piApi);
-	} catch (err) {
-		debug(`calibration: provider refresh failed (${reason})`, err);
-	}
+	processState.calibrationRefreshPending = false;
+	const models = processState.models ?? MODELS;
+	debug(`calibration: refreshing provider registrations (${reason}) models=${models.length}`);
+	fanOutProviderRegistration(models, `calibration:${reason}`);
 }
 
 // --- Error handling ---
@@ -198,32 +303,6 @@ function errorMessage(err: unknown): string {
 	}
 	return String(err);
 }
-
-// AskCodebuddy mode presets — controls which CC tools are blocked per mode.
-// Only block tools that can't work (no pi TUI for user interaction).
-// Other CC tools (Agent, SendMessage, RemoteTrigger, Tasks, etc.) are intentionally not blocked.
-const ASKCLAUDE_ALWAYS_BLOCKED = [
-	"AskUserQuestion", "EnterPlanMode", "ExitPlanMode",
-	"ToolSearch", // probes for blocked tools, wastes tokens
-	"ScheduleWakeup", // no harness to fire wakeup from inside a delegated subagent
-];
-const MODE_DISALLOWED_TOOLS: Record<string, string[]> = {
-	full: [
-		...ASKCLAUDE_ALWAYS_BLOCKED,
-	],
-	read: [
-		...ASKCLAUDE_ALWAYS_BLOCKED,
-		"Write", "Edit", "Bash", "NotebookEdit",
-		"EnterWorktree", "ExitWorktree", "CronCreate", "CronDelete", "TeamCreate", "TeamDelete",
-	],
-	none: [
-		...ASKCLAUDE_ALWAYS_BLOCKED,
-		"Read", "Write", "Edit", "Glob", "Grep", "Bash", "Agent",
-		"NotebookEdit", "EnterWorktree", "ExitWorktree",
-		"CronCreate", "CronDelete", "TeamCreate", "TeamDelete",
-		"WebFetch", "WebSearch",
-	],
-};
 
 // --- Session persistence ---
 
@@ -247,8 +326,14 @@ interface SessionState {
 	forceRotate?: boolean;
 }
 
-let sharedSession: SessionState | null = null;
-
+const providerSessionSlot = {
+	get current(): SessionState | null {
+		return currentProviderRuntimeState().sharedSession;
+	},
+	set current(value: SessionState | null) {
+		currentProviderRuntimeState().sharedSession = value;
+	},
+};
 // Convert pi messages to Anthropic API format for session import.
 // Lossy: non-Anthropic thinking blocks are dropped (no valid signature), and only
 // text/image/toolCall block types are handled. If all blocks in an assistant message
@@ -311,6 +396,7 @@ function extractUserPromptBlocks(messages: Context["messages"]): ContentBlockPar
 	}
 	debug(`extractUserPromptBlocks: ${last.content.length} blocks, types=${last.content.map((b: any) => b.type).join(",")}`);
 	let hasImage = false;
+	let hadInvalidImage = false;
 	const blocks: ContentBlockParam[] = [];
 	for (const block of last.content) {
 		if (block.type === "text" && block.text) {
@@ -319,6 +405,7 @@ function extractUserPromptBlocks(messages: Context["messages"]): ContentBlockPar
 			debug(`image block: mimeType=${(block as any).mimeType}, data length=${((block as any).data ?? "").length}, keys=${Object.keys(block).join(",")}`);
 			if (!(block as any).data || !(block as any).mimeType) {
 				debug(`image block missing data or mimeType, skipping`);
+				hadInvalidImage = true;
 				continue;
 			}
 			hasImage = true;
@@ -328,7 +415,8 @@ function extractUserPromptBlocks(messages: Context["messages"]): ContentBlockPar
 			});
 		}
 	}
-	return hasImage ? blocks : null;
+	if (hadInvalidImage) blocks.push({ type: "text", text: "[invalid image omitted]" });
+	return hasImage || hadInvalidImage ? blocks : null;
 }
 
 async function* wrapPromptStream(blocks: ContentBlockParam[]): AsyncIterable<CbUserMessage> {
@@ -380,28 +468,155 @@ function isolatedStreamFn(model: Model<any>, context: Context, options?: SimpleS
 	return stream;
 }
 
+const COMPACT_SUMMARY_TIMEOUT_MS = 60_000;
+const COMPACT_SUMMARY_CLOSE_GRACE_MS = 1_000;
+
+type IsolatedSummaryOutcome =
+	| { kind: "success"; text: string }
+	| { kind: "aborted" }
+	| { kind: "error"; message: string };
+
+type IsolatedSummaryQuery = AsyncIterable<CbMessage> & {
+	return(): Promise<unknown>;
+};
+
+interface ConsumeIsolatedSummaryQueryInput {
+	sdkQuery: IsolatedSummaryQuery;
+	model: Model<any>;
+	abortController: AbortController;
+	signal?: AbortSignal;
+	timeoutMs?: number;
+	closeGraceMs?: number;
+	forceClose?: (sdkQuery: IsolatedSummaryQuery) => void;
+}
+
+// The current SDK's Query.return() only interrupts; cleanup() is the operation
+// that closes the transport. Keep this version-coupled fallback in one adapter.
+function forceCloseSdkQuery(sdkQuery: IsolatedSummaryQuery): void {
+	const cleanup = (sdkQuery as IsolatedSummaryQuery & { cleanup?: () => void }).cleanup;
+	if (typeof cleanup === "function") cleanup.call(sdkQuery);
+}
+
+async function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			promise.then(() => true, () => true),
+			new Promise<boolean>((resolve) => {
+				timer = setTimeout(() => resolve(false), timeoutMs);
+				timer.unref?.();
+			}),
+		]);
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
+}
+
+async function consumeIsolatedSummaryQuery(
+	input: ConsumeIsolatedSummaryQueryInput,
+): Promise<IsolatedSummaryOutcome> {
+	const timeoutMs = input.timeoutMs ?? COMPACT_SUMMARY_TIMEOUT_MS;
+	const closeGraceMs = input.closeGraceMs ?? COMPACT_SUMMARY_CLOSE_GRACE_MS;
+	const forceClose = input.forceClose ?? forceCloseSdkQuery;
+	let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+	let abortListener: (() => void) | undefined;
+
+	const consumePromise = (async (): Promise<IsolatedSummaryOutcome> => {
+		let assistantText = "";
+		let finalText = "";
+		let errorText: string | undefined;
+		let firstEventLogged = false;
+		try {
+			for await (const message of input.sdkQuery) {
+				if (!firstEventLogged) {
+					debug(`compact summary: first event type=${message.type}`);
+					firstEventLogged = true;
+				}
+				if (message.type === "assistant") {
+					for (const block of (message as any).message?.content ?? []) {
+						if (block.type === "text" && typeof block.text === "string") assistantText += block.text;
+					}
+				} else if (message.type === "result") {
+					await logServedContextWindow("compact summary", message, input.model);
+					if (message.subtype === "success") finalText = message.result || assistantText;
+					else errorText = resultErrorText(message);
+				}
+			}
+			const text = finalText || assistantText;
+			if (errorText || !text.trim()) {
+				return { kind: "error", message: errorText ?? "CodeBuddy summary returned empty text" };
+			}
+			return { kind: "success", text };
+		} catch (error) {
+			return { kind: "error", message: errorMessage(error) };
+		}
+	})();
+
+	const timeoutPromise = new Promise<{ source: "timeout" }>((resolve) => {
+		timeoutTimer = setTimeout(() => resolve({ source: "timeout" }), timeoutMs);
+		timeoutTimer.unref?.();
+	});
+	const abortPromise = new Promise<{ source: "abort" }>((resolve) => {
+		if (!input.signal) return;
+		abortListener = () => resolve({ source: "abort" });
+		if (input.signal.aborted) abortListener();
+		else input.signal.addEventListener("abort", abortListener, { once: true });
+	});
+
+	try {
+		const winner = await Promise.race([
+			consumePromise.then((outcome) => ({ source: "consume" as const, outcome })),
+			timeoutPromise,
+			abortPromise,
+		]);
+		if (winner.source === "consume") return winner.outcome;
+
+		input.abortController.abort();
+		try {
+			void Promise.resolve(input.sdkQuery.return()).catch((error) => {
+				debug("compact summary: graceful return failed", error);
+			});
+		} catch (error) {
+			debug("compact summary: graceful return threw", error);
+		}
+		if (!(await settlesWithin(consumePromise, closeGraceMs))) {
+			try {
+				forceClose(input.sdkQuery);
+			} catch (error) {
+				debug("compact summary: hard close failed", error);
+			}
+		}
+		if (winner.source === "abort") return { kind: "aborted" };
+		return { kind: "error", message: `CodeBuddy compact summary timed out after ${timeoutMs}ms` };
+	} finally {
+		if (timeoutTimer) clearTimeout(timeoutTimer);
+		if (input.signal && abortListener) input.signal.removeEventListener("abort", abortListener);
+	}
+}
+
 async function runIsolatedSummary(
 	model: Model<any>,
 	context: Context,
 	options: SimpleStreamOptions | undefined,
 	stream: AssistantMessageEventStream,
 ): Promise<void> {
-	let sdkQuery: ReturnType<typeof query> | undefined;
-	let wasAborted = false;
-	const onAbort = () => {
-		wasAborted = true;
-		void sdkQuery?.interrupt().catch(() => {});
-		try { sdkQuery?.interrupt(); } catch {}
-	};
-
 	try {
+		if (options?.signal?.aborted) {
+			const output = newAssistantOutput(model, "", "aborted", "Operation aborted");
+			stream.push({ type: "error", reason: "aborted", error: output });
+			stream.end();
+			return;
+		}
 		const promptText = extractIsolatedSummaryPrompt(context.messages);
-		const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
-		const codebuddyExecutable = loadConfig(cwd).provider?.pathToCodebuddyCode;
+		const invocationRoute = getProviderInvocationRoute(options);
+		if (!invocationRoute) throw new Error("CodeBuddy compact summary is missing its Pi runtime route");
+		const cwd = invocationRoute.canonicalCwd;
+		const codebuddyExecutable = invocationRoute.provider.pathToCodebuddyCode;
 		const cliModel = codebuddyModelId(model);
 		debug(`compact summary: spawn model=${cliModel} registeredModel=${model.id} promptLen=${promptText.length}`);
 
-		sdkQuery = query({
+		const abortController = new AbortController();
+		const sdkQuery = query({
 			prompt: promptText,
 			options: {
 				cwd,
@@ -413,70 +628,38 @@ async function runIsolatedSummary(
 				systemPrompt: context.systemPrompt,
 				model: cliModel,
 				maxTurns: 1,
+				abortController,
 				...(codebuddyExecutable ? { pathToCodebuddyCode: codebuddyExecutable } : {}),
 				...makeCliDebugOptions("compact-summary"),
 			},
 		});
-
-		if (options?.signal) {
-			if (options.signal.aborted) onAbort();
-			else options.signal.addEventListener("abort", onAbort, { once: true });
-		}
-
-		let assistantText = "";
-		let finalText = "";
-		let errorText: string | undefined;
-		let firstEventLogged = false;
-
-		for await (const message of sdkQuery) {
-			if (!firstEventLogged) {
-				debug(`compact summary: first event type=${message.type}`);
-				firstEventLogged = true;
-			}
-			if (wasAborted) break;
-
-			if (message.type === "assistant") {
-				for (const block of (message as any).message?.content ?? []) {
-					if (block.type === "text" && typeof block.text === "string") assistantText += block.text;
-				}
-			} else if (message.type === "result") {
-				logServedContextWindow("compact summary", message, model);
-				if (message.subtype === "success") {
-					finalText = message.result || assistantText;
-				} else {
-					errorText = resultErrorText(message);
-				}
-			}
-		}
-
-		if (wasAborted) {
+		const outcome = await consumeIsolatedSummaryQuery({
+			sdkQuery,
+			model,
+			abortController,
+			signal: options?.signal,
+		});
+		if (outcome.kind === "aborted") {
 			const output = newAssistantOutput(model, "", "aborted", "Operation aborted");
 			debug("compact summary: aborted");
 			stream.push({ type: "error", reason: "aborted", error: output });
 			stream.end();
 			return;
 		}
-
-		const text = finalText || assistantText;
-		if (errorText || !text.trim()) {
-			const msg = errorText ?? "CodeBuddy summary returned empty text";
-			debug(`compact summary: error ${msg}`);
-			stream.push({ type: "error", reason: "error", error: newAssistantOutput(model, "", "error", msg) });
+		if (outcome.kind === "error") {
+			debug(`compact summary: error ${outcome.message}`);
+			stream.push({ type: "error", reason: "error", error: newAssistantOutput(model, "", "error", outcome.message) });
 			stream.end();
 			return;
 		}
-
-		debug(`compact summary: done textLen=${text.length}`);
-		stream.push({ type: "done", reason: "stop", message: newAssistantOutput(model, text, "stop") });
+		debug(`compact summary: done textLen=${outcome.text.length}`);
+		stream.push({ type: "done", reason: "stop", message: newAssistantOutput(model, outcome.text, "stop") });
 		stream.end();
 	} catch (err) {
 		const msg = errorMessage(err);
 		debug("runIsolatedSummary threw; pushing terminal error", err);
 		stream.push({ type: "error", reason: "error", error: newAssistantOutput(model, "", "error", msg) });
 		stream.end();
-	} finally {
-		options?.signal?.removeEventListener("abort", onAbort);
-		try { sdkQuery?.interrupt(); } catch {}
 	}
 }
 
@@ -513,7 +696,7 @@ function verifyWrittenSession(
 	const warnings = _verifyWrittenSession(jsonlPath, expectedSessionId, expectedRecordCount);
 	for (const msg of warnings) {
 		debug(`WARNING session verify: ${msg}`);
-		piUI?.notify(
+		providerUiSlot.current?.notify(
 			`Session sync issue: ${msg}. ` +
 			`cwd=${redactForLog(cwd)}` +
 			(DEBUG ? ` (see ${redactForLog(DEBUG_LOG_PATH)})` : ` (set CODEBUDDY_SDK_DEBUG=1 for a local log)`) +
@@ -547,7 +730,7 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 }
 
 // Two semantic paths:
-//   REUSE — pi's history is in sync with the existing sharedSession (or drifted
+//   REUSE — pi's history is in sync with the existing providerSessionSlot.current (or drifted
 //     only by the trailing final-assistant message that pi appends after
 //     streamSimple returns, which CC's own persisted session already has).
 //     Returns the existing sessionId. Keeps CC's prompt cache warm.
@@ -586,26 +769,28 @@ function syncSharedSession(
 	// pi-side history rewrites such as /compact and session_tree: without it,
 	// missed = [].slice(cursor) can falsely hit REUSE and resume an unrelated
 	// longer CC session. See issue #25.
-	if (sharedSession && !sharedSession.needsRebuild && priorMessages.length >= sharedSession.cursor) {
-		const missed = priorMessages.slice(sharedSession.cursor);
+	const cachedSession = providerSessionSlot.current;
+	const sameStorageCwd = cachedSession?.cwd === cwd;
+	if (cachedSession && sameStorageCwd && !cachedSession.needsRebuild && priorMessages.length >= cachedSession.cursor) {
+		const missed = priorMessages.slice(providerSessionSlot.current.cursor);
 		const trailingAssistantOnly =
 			missed.length === 1 && (missed[0] as { role?: string }).role === "assistant";
 		if (missed.length === 0 || trailingAssistantOnly) {
 			if (trailingAssistantOnly) {
-				sharedSession = { ...sharedSession, cursor: priorMessages.length, cwd };
+				providerSessionSlot.current = { ...providerSessionSlot.current, cursor: priorMessages.length, cwd };
 			}
-			debug(`Case 3: ${trailingAssistantOnly ? "advanced cursor past trailing assistant, " : ""}resuming session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
-			debug(`syncResult: path=reuse sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor}`);
-			return { sessionId: sharedSession.sessionId };
+			debug(`Case 3: ${trailingAssistantOnly ? "advanced cursor past trailing assistant, " : ""}resuming session ${providerSessionSlot.current.sessionId.slice(0, 8)}, cursor=${providerSessionSlot.current.cursor}`);
+			debug(`syncResult: path=reuse sessionId=${providerSessionSlot.current.sessionId} cursor=${providerSessionSlot.current.cursor}`);
+			return { sessionId: providerSessionSlot.current.sessionId };
 		}
 	}
 	// Only reachable when needsRebuild is false — user-facing history rewrites
 	// (/compact, session_tree, /new, fork) always set needsRebuild or clear
-	// sharedSession before the next syncSharedSession call. In practice this
+	// providerSessionSlot.current before the next syncSharedSession call. In practice this
 	// fires only for isolated compact-summary subprocesses.
-	if (sharedSession && !sharedSession.needsRebuild && priorMessages.length < sharedSession.cursor) {
-		debug(`Case 1 synthetic: clean start for shorter context, preserving shared session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
-		debug(`syncResult: path=clean-start preserve-shared sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor}`);
+	if (cachedSession && sameStorageCwd && !cachedSession.needsRebuild && priorMessages.length < cachedSession.cursor) {
+		debug(`Case 1 synthetic: clean start for shorter context, preserving shared session ${providerSessionSlot.current.sessionId.slice(0, 8)}, cursor=${providerSessionSlot.current.cursor}`);
+		debug(`syncResult: path=clean-start preserve-shared sessionId=${providerSessionSlot.current.sessionId} cursor=${providerSessionSlot.current.cursor}`);
 		return { sessionId: null, preserveSharedSession: true };
 	}
 
@@ -615,13 +800,16 @@ function syncSharedSession(
 		debug(`syncResult: path=clean-start`);
 		return { sessionId: null };
 	}
-	const previousSessionId = sharedSession?.sessionId;
-	const previousCursor = sharedSession?.cursor ?? 0;
+	const previousSessionId = sameStorageCwd ? providerSessionSlot.current?.sessionId : undefined;
+	const previousCursor = sameStorageCwd ? providerSessionSlot.current?.cursor ?? 0 : 0;
+	if (cachedSession && !sameStorageCwd) {
+		debug(`syncSharedSession: storage cwd mismatch; cached=${redactForLog(cachedSession.cwd)} current=${redactForLog(cwd)} — creating an independent session without deleting the cached project session`);
+	}
 	// preserveId: rebuild in place (deleteSession + createSession with the
 	// existing UUID), so prompt-cache UUIDs stay stable for log correlation
 	// and for any tools that key off them. Skipped only when there's a
 	// concurrent writer we shouldn't race — see forceRotate docs above.
-	const preserveId = previousSessionId !== undefined && !sharedSession?.forceRotate;
+	const preserveId = previousSessionId !== undefined && !providerSessionSlot.current?.forceRotate;
 	if (preserveId) {
 		// Wipe prior jsonl + companion dir (no-op if nothing to wipe).
 		deleteSession(previousSessionId!, cwd, process.env.CODEBUDDY_CONFIG_DIR);
@@ -635,7 +823,7 @@ function syncSharedSession(
 	convertAndImportMessages(session, priorMessages, customToolNameToSdk);
 	session.save();
 	verifyWrittenSession(session.jsonlPath, session.sessionId, session.messages.length, cwd);
-	sharedSession = { sessionId: session.sessionId, cursor: priorMessages.length, cwd };
+	providerSessionSlot.current = { sessionId: session.sessionId, cursor: priorMessages.length, cwd };
 	if (previousSessionId === undefined) {
 		debug(`Case 2: first turn with ${priorMessages.length} prior messages → session ${session.sessionId.slice(0, 8)}, ${session.messages.length} records`);
 	} else if (preserveId) {
@@ -652,23 +840,34 @@ function syncSharedSession(
 // @internal
 export const __test = {
 	resetSharedSession() {
-		sharedSession = null;
+		providerSessionSlot.current = null;
 	},
 	setSharedSession(state: SessionState | null) {
-		sharedSession = state;
+		providerSessionSlot.current = state;
 	},
 	getSharedSession() {
-		return sharedSession;
+		return providerSessionSlot.current;
 	},
+	createProviderRuntimeState,
+	runWithProviderRuntimeState,
 	createDelegationSessionFromContext,
+	extractUserPromptBlocks,
 	buildProviderBoundaryOptions,
 	buildProviderQueryOptions,
+	resolveMcpTools,
 	syncSharedSession,
 	isEmptyArgs,
+	mapToolArgs,
 	hasRequiredParams,
 	claimSerialToolUse,
 	interruptLiveQuery,
 	processStreamEvent,
+	processAssistantMessage,
+	resolvePermissionPendingTool,
+	finalizePermissionPending,
+	buildMcpServers,
+	consumeIsolatedSummaryQuery,
+	buildModelDiscoveryOptions,
 };
 
 function createDelegationSessionFromContext(
@@ -781,11 +980,14 @@ function hasRequiredParams(toolName: string, tools: Tool[]): boolean {
 }
 
 function claimSerialToolUse(queryCtx: QueryContext, toolUseId: string): boolean {
-	if (!queryCtx.claimedToolUseId) {
+	if (queryCtx.claimedToolUseId && queryCtx.claimedToolUseId !== toolUseId) return false;
+	if (queryCtx.claimedToolUseId === toolUseId) return true;
+	const decision = queryCtx.turnCoordinator.recordPermissionDecision(toolUseId, "unknown", "allow");
+	if (decision.behavior === "allow") {
 		queryCtx.claimedToolUseId = toolUseId;
 		return true;
 	}
-	return queryCtx.claimedToolUseId === toolUseId;
+	return false;
 }
 
 function interruptLiveQuery(ref: { current?: { interrupt?: () => Promise<void> | void } }): void {
@@ -812,8 +1014,10 @@ function mapToolArgs(
 		const piKey = renames?.[key] ?? key;
 		if (!(piKey in result)) result[piKey] = value; // first alias wins
 	}
-	// Pi bash has no default timeout; add a safety default
-	if (toolName.toLowerCase() === "bash" && result.timeout == null) {
+	// Add the default only after a real argument object is present. Otherwise a
+	// parallel-dispatch {} becomes { timeout: 120 } and bypasses the empty-args
+	// guard while still missing bash's required command field.
+	if (toolName.toLowerCase() === "bash" && !isEmptyArgs(input) && result.timeout == null) {
 		result.timeout = 120;
 	}
 	return result;
@@ -823,19 +1027,31 @@ function mapToolArgs(
 
 // --- Provider helpers: tool bridge ---
 
+const MCP_DISPATCH_MATCH_TIMEOUT_MS = 30_000;
+
 // --- Query state ---
 // QueryContext lives in query-state.js so tests can import it without
 // activating the extension.
 
 // Global (not query state):
-let piUI: ExtensionUIContext | null = null;
-const activeQueryContexts = new Set<QueryContext>();
+const providerUiSlot = {
+	get current(): ExtensionUIContext | null {
+		return currentProviderRuntimeState().piUI;
+	},
+	set current(value: ExtensionUIContext | null) {
+		currentProviderRuntimeState().piUI = value;
+	},
+};
+
+function providerActiveQueries(): Set<QueryContext> {
+	return currentProviderRuntimeState().activeQueryContexts;
+}
 
 function contextForToolResults(results: McpResult[]): QueryContext | undefined {
 	for (const result of results) {
 		const id = result.toolCallId;
 		if (!id) continue;
-		for (const queryCtx of activeQueryContexts) {
+		for (const queryCtx of providerActiveQueries()) {
 			if (queryCtx.pendingToolCalls.has(id) || queryCtx.pendingResults.has(id) || queryCtx.turnToolCallIds.includes(id)) {
 				return queryCtx;
 			}
@@ -844,7 +1060,7 @@ function contextForToolResults(results: McpResult[]): QueryContext | undefined {
 	return undefined;
 }
 
-function resolveMcpTools(context: Context, excludeToolName?: string): {
+function resolveMcpTools(context: Context, excludeToolNames?: ReadonlySet<string>): {
 	mcpTools: Tool[];
 	customToolNameToSdk: Map<string, string>;
 	customToolNameToPi: Map<string, string>;
@@ -856,7 +1072,7 @@ function resolveMcpTools(context: Context, excludeToolName?: string): {
 	if (!context.tools) return { mcpTools, customToolNameToSdk, customToolNameToPi };
 
 	for (const tool of context.tools) {
-		if (tool.name === excludeToolName) continue;
+		if (excludeToolNames?.has(tool.name)) continue;
 		const sdkName = `${MCP_TOOL_PREFIX}${tool.name}`;
 		mcpTools.push(enhancePiToolForCodebuddy(tool));
 		customToolNameToSdk.set(tool.name, sdkName);
@@ -868,15 +1084,62 @@ function resolveMcpTools(context: Context, excludeToolName?: string): {
 	return { mcpTools, customToolNameToSdk, customToolNameToPi };
 }
 
+function bindPendingMcpDispatch(
+	queryCtx: QueryContext,
+	toolName: string,
+	toolCallId: string,
+	args: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+	const pendingIndex = queryCtx.pendingMcpDispatches.findIndex((pending) => pending.toolName === toolName);
+	if (pendingIndex < 0) return undefined;
+	const pending = queryCtx.pendingMcpDispatches.splice(pendingIndex, 1)[0];
+	if (pending.deadlineTimer) clearTimeout(pending.deadlineTimer);
+	queryCtx.matchedToolCallIds.add(toolCallId);
+	if (isEmptyArgs(args)) {
+		queryCtx.pendingToolCalls.set(toolCallId, { toolName, resolve: pending.resolve });
+		return pending.args;
+	}
+	if (queryCtx.pendingResults.has(toolCallId)) {
+		const result = queryCtx.pendingResults.get(toolCallId)!;
+		queryCtx.pendingResults.delete(toolCallId);
+		pending.resolve(result);
+		return pending.args;
+	}
+	queryCtx.pendingToolCalls.set(toolCallId, { toolName, resolve: pending.resolve });
+	return pending.args;
+}
+
+function drainPendingMcpDispatches(queryCtx: QueryContext, text: string): void {
+	queryCtx.drainPendingMcpDispatches(text);
+}
+
+function deniedMcpResult(toolName: string): McpResult {
+	return {
+		content: [{ type: "text", text: `Tool "${toolName}" was denied before execution.` }],
+		isError: true,
+	};
+}
+
 // Creates an MCP server that bridges pi tools to the SDK. Each tool handler
 // blocks on a Promise until pi delivers the tool result via streamSimple.
 // Handlers are assigned toolCallIds from turnToolCallIds (populated when the SDK
 // emits tool_use blocks). Results are matched by ID, not position.
 // Handlers close over the captured `queryCtx`, ensuring they operate on the
 // correct query's state while multiple queries run concurrently.
-function buildMcpServers(tools: Tool[], queryCtx: QueryContext): Record<string, ReturnType<typeof createSdkMcpServer>> | undefined {
-	if (!tools.length) return undefined;
-	const mcpTools = tools.map((tool) => ({
+function buildMcpServers(tools: Tool[], queryCtx: QueryContext): {
+	servers?: Record<string, ReturnType<typeof createSdkMcpServer>>;
+	tools: Tool[];
+} {
+	if (!tools.length) return { tools: [] };
+	const mcpTools = tools.flatMap((tool) => {
+		const conversion = tryJsonSchemaToZodObjectForMcp(tool.parameters);
+		if (conversion.error) {
+			const warning = `CodeBuddy SDK: skipped Pi tool ${tool.name} because its schema is unsupported at ${conversion.error.path} (${conversion.error.keyword})`;
+			providerUiSlot.current?.notify(warning, "warning");
+			if (!providerUiSlot.current) console.warn(warning);
+			return [];
+		}
+		return [{
 		name: tool.name,
 		description: tool.description,
 		// MCP schema preserves required constraints so empty {} (from parallel
@@ -884,9 +1147,10 @@ function buildMcpServers(tools: Tool[], queryCtx: QueryContext): Record<string, 
 		// signal that args were lost. The deferred-backfill logic handles the
 		// stream side; this handles the dispatch side. Passthrough allows extra
 		// keys for forward-compat.
-		inputSchema: jsonSchemaToZodObjectForMcp(tool.parameters),
-		handler: async (dispatchArgs?: Record<string, unknown>) => {
-			// Name-based toolCallId matching: find the first toolCallId whose
+			inputSchema: conversion.schema!,
+			handler: async (dispatchArgs?: Record<string, unknown>) => {
+				const mappedDispatchArgs = mapToolArgs(tool.name, dispatchArgs);
+				// Name-based toolCallId matching: find the first toolCallId whose
 			// corresponding turnBlock has a name matching this tool, and hasn't
 			// been claimed by a previous handler invocation. This fixes the
 			// parallel-dispatch race where CodeBuddy calls MCP handlers in a
@@ -896,28 +1160,41 @@ function buildMcpServers(tools: Tool[], queryCtx: QueryContext): Record<string, 
 			//
 			// Fallback to index-based for robustness (e.g. if turnBlocks doesn't
 			// have the block yet, or same-name dedup edge cases).
-			let toolCallId: string | undefined;
-			for (const id of queryCtx.turnToolCallIds) {
-				if (queryCtx.matchedToolCallIds.has(id)) continue;
-				const block = queryCtx.turnBlocks.find((b: any) => b.id === id && b.type === "toolCall");
-				if (block && block.name === tool.name) {
-					toolCallId = id;
-					queryCtx.matchedToolCallIds.add(id);
-					break;
+				let toolCallId = queryCtx.turnCoordinator.observeDispatch(tool.name, mappedDispatchArgs);
+				if (toolCallId) queryCtx.matchedToolCallIds.add(toolCallId);
+					if (!toolCallId) {
+						debug(`mcp handler ${tool.name} arrived before a matching stream tool id; buffering by tool name`);
+						return new Promise<McpResult>((resolve) => {
+							const pending: PendingMcpDispatch = {
+								toolName: tool.name,
+								args: mappedDispatchArgs,
+								resolve,
+							};
+							pending.deadlineTimer = setTimeout(() => {
+								const index = queryCtx.pendingMcpDispatches.indexOf(pending);
+								if (index < 0) return;
+								queryCtx.pendingMcpDispatches.splice(index, 1);
+								queryCtx.turnCoordinator.cancelPendingDispatch(tool.name);
+								debug(`mcp handler ${tool.name} timed out waiting for a stream tool id`);
+								resolve({
+									content: [{ type: "text", text: `Tool "${tool.name}" timed out waiting for its streamed tool call.` }],
+									isError: true,
+								});
+							}, MCP_DISPATCH_MATCH_TIMEOUT_MS);
+							pending.deadlineTimer.unref?.();
+							queryCtx.pendingMcpDispatches.push(pending);
+						});
+					}
+				if (queryCtx.turnCoordinator.snapshot().deniedIds.includes(toolCallId)) {
+					debug(`mcp handler: ${tool.name} [${toolCallId}] denied before execution`);
+					resolvePermissionPendingTool(queryCtx, toolCallId, false);
+					return deniedMcpResult(tool.name);
 				}
-			}
-			// Fallback: if no name match, use index (handles edge cases where
-			// block.name hasn't been mapped yet or same-name calls overflow)
-			if (!toolCallId) {
-				toolCallId = queryCtx.turnToolCallIds[queryCtx.nextHandlerIdx];
-				if (toolCallId) {
-					queryCtx.matchedToolCallIds.add(toolCallId);
-					queryCtx.nextHandlerIdx++;
+				if (queryCtx.turnCoordinator.isAllowed(toolCallId)) {
+					resolvePermissionPendingTool(queryCtx, toolCallId, true, true);
 				}
-			}
-			if (!toolCallId) debug(`WARNING: mcp handler ${tool.name} has no toolCallId (matched=${queryCtx.matchedToolCallIds.size}, available=${queryCtx.turnToolCallIds.length})`);
 
-			debug(`mcp dispatch: ${tool.name} dispatchArgsLen=${JSON.stringify(dispatchArgs ?? {}).length} dispatchArgsEmpty=${isEmptyArgs(dispatchArgs)} matched=${queryCtx.matchedToolCallIds.size}/${queryCtx.turnToolCallIds.length} pendingBlocks=${queryCtx.argsPendingBlocks.length}`);
+				debug(`mcp dispatch: ${tool.name} dispatchArgsLen=${JSON.stringify(mappedDispatchArgs).length} dispatchArgsEmpty=${isEmptyArgs(mappedDispatchArgs)} matched=${queryCtx.matchedToolCallIds.size}/${queryCtx.turnToolCallIds.length} pendingBlocks=${queryCtx.argsPendingBlocks.length}`);
 
 			// Backfill path: if there are args-pending blocks whose toolcall_end
 			// was deferred (stream args were empty), try to backfill using the
@@ -927,22 +1204,24 @@ function buildMcpServers(tools: Tool[], queryCtx: QueryContext): Record<string, 
 				const pendingIdx = queryCtx.argsPendingBlocks.findIndex((p) => p.block.id === toolCallId);
 				if (pendingIdx >= 0) {
 					const pending = queryCtx.argsPendingBlocks[pendingIdx];
-					const backfillArgs = mapToolArgs(tool.name, dispatchArgs);
-					if (!isEmptyArgs(backfillArgs)) {
+						const backfillArgs = mappedDispatchArgs;
+						if (!isEmptyArgs(backfillArgs)) {
 						pending.block.arguments = backfillArgs;
 						debug(`mcp handler: backfilled ${tool.name} [${toolCallId}] from MCP dispatch args (argsLen=${JSON.stringify(backfillArgs).length})`);
 					} else {
 						debug(`mcp handler: dispatch args also empty for ${tool.name} [${toolCallId}], emitting with current args`);
-					}
-					queryCtx.turnSawToolCall = true;
-					queryCtx.currentPiStream?.push({ type: "toolcall_end", contentIndex: pending.contentIndex, toolCall: pending.block, partial: queryCtx.turnOutput });
+						}
+						queryCtx.turnSawToolCall = true;
+						queryCtx.currentPiStream?.push({ type: "toolcall_end", contentIndex: pending.contentIndex, toolCall: pending.block, partial: queryCtx.turnOutput });
+						pending.block.__piToolcallEndEmitted = true;
 					queryCtx.argsPendingBlocks.splice(pendingIdx, 1);
 
 					// If all pending blocks are now resolved and done was deferred, emit it
-					if (queryCtx.argsPendingBlocks.length === 0 && queryCtx.doneDeferredForArgs && queryCtx.currentPiStream && queryCtx.turnOutput) {
-						queryCtx.doneDeferredForArgs = false;
-						queryCtx.turnOutput.stopReason = "toolUse";
-						const stream = queryCtx.currentPiStream;
+						if (queryCtx.argsPendingBlocks.length === 0 && queryCtx.doneDeferredForArgs && queryCtx.currentPiStream && queryCtx.turnOutput) {
+							queryCtx.doneDeferredForArgs = false;
+							queryCtx.turnOutput.stopReason = "toolUse";
+							expectTrailingAssistant(queryCtx);
+							const stream = queryCtx.currentPiStream;
 						stream.push({ type: "done", reason: "toolUse", message: queryCtx.turnOutput });
 						markStreamComplete(stream);
 						stream.end();
@@ -962,10 +1241,11 @@ function buildMcpServers(tools: Tool[], queryCtx: QueryContext): Record<string, 
 			return new Promise<McpResult>((resolve) => {
 				queryCtx.pendingToolCalls.set(toolCallId, { toolName: tool.name, resolve });
 			});
-		},
-	}));
+		}}];
+	});
+	if (!mcpTools.length) return { tools: [] };
 	const server = createSdkMcpServer({ name: MCP_SERVER_NAME, version: "1.0.0", tools: mcpTools });
-	return { [MCP_SERVER_NAME]: server };
+	return { servers: { [MCP_SERVER_NAME]: server }, tools: tools.filter((tool) => mcpTools.some((mcpTool) => mcpTool.name === tool.name)) };
 }
 
 // --- Usage helpers ---
@@ -992,45 +1272,92 @@ function updateUsage(output: AssistantMessage, usage: Record<string, number | un
 // match the docs — e.g. bare Opus served 200K on Pro, or [1m] not honored.
 // The result message's modelUsage is otherwise discarded; this makes the
 // gap observable. See issue #18.
-function logServedContextWindow(label: string, message: CbMessage, model: Model<any>): void {
+async function logServedContextWindow(label: string, message: CbMessage, model: Model<any>): Promise<void> {
 	const modelUsage = (message as any).modelUsage as Record<string, { contextWindow?: number; maxOutputTokens?: number }> | undefined;
 	if (!modelUsage) return;
 	for (const [k, v] of Object.entries(modelUsage)) {
 		debug(`${label}: served contextWindow=${v.contextWindow ?? "?"} maxOutputTokens=${v.maxOutputTokens ?? "?"} servedModel=${k} registered=${model.contextWindow}`);
-		if (typeof v.contextWindow === "number") observeServedContextWindow(label, k, v.contextWindow, model);
+		if (typeof v.contextWindow === "number") await observeServedContextWindow(label, k, v.contextWindow, model);
 	}
 }
 
-function observeServedContextWindow(label: string, servedModel: string, observed: number, model: Model<any>): void {
+async function observeServedContextWindow(
+	label: string,
+	servedModel: string,
+	observed: number,
+	model: Model<any>,
+): Promise<void> {
 	if (!Number.isFinite(observed) || observed <= 0) return;
+	const processState = getProviderProcessState();
+	const environment = calibrationEnvironment;
+	const transactionKey = buildCalibrationKey(model.id, environment);
+	const previousTransaction = processState.calibrationTransactions.get(transactionKey) ?? Promise.resolve();
+	const transaction = previousTransaction
+		.catch(() => undefined)
+		.then(() => commitServedContextWindow(label, servedModel, observed, model, environment));
+	processState.calibrationTransactions.set(transactionKey, transaction);
 	try {
-		const previousRegistered = MODELS.find((candidate) => candidate.id === model.id)?.contextWindow;
-		const { changed, record } = recordObservedContextWindow(
-			calibrationCache,
-			model.id,
-			calibrationEnvironment,
-			observed,
-		);
-		if (!changed) return;
-		saveCalibrationCache(calibrationCache);
-		const latest = record.capabilities.contextWindow?.latest;
-		if (latest != null) {
-			MODELS = MODELS.map((candidate) => (
-				candidate.id === model.id
-					? { ...candidate, contextWindow: latest }
-					: candidate
-			));
+		await transaction;
+	} finally {
+		if (processState.calibrationTransactions.get(transactionKey) === transaction) {
+			processState.calibrationTransactions.delete(transactionKey);
 		}
-		debug(
-			`calibration: ${label} observed=${observed} floor=${record.capabilities.contextWindow?.floor ?? "?"} ` +
-			`latest=${record.capabilities.contextWindow?.latest ?? "?"} servedModel=${servedModel} registeredBefore=${previousRegistered ?? "?"}`,
-		);
-		if (latest != null && previousRegistered != null && latest !== previousRegistered) {
-			scheduleCalibrationRefresh(`contextWindow:${model.id}`);
-		}
-	} catch (err) {
-		debug(`calibration: failed to persist observed context window for ${model.id}`, err);
 	}
+}
+
+async function commitServedContextWindow(
+	label: string,
+	servedModel: string,
+	observed: number,
+	model: Model<any>,
+	environment: CalibrationEnvironment,
+): Promise<void> {
+	const processState = getProviderProcessState();
+	if (processState.models) MODELS = processState.models;
+	calibrationCache = processState.calibrationCache ?? calibrationCache;
+	processState.calibrationCache = calibrationCache;
+	const previousRegistered = MODELS.find((candidate) => candidate.id === model.id)?.contextWindow;
+	const pendingKey = buildCalibrationKey(model.id, environment);
+	const pendingObservation = processState.pendingCalibrationObservations.get(pendingKey);
+	const transaction = await updateObservedContextWindow(
+		DEFAULT_CALIBRATION_CACHE_PATH,
+		model.id,
+		environment,
+		observed,
+		calibrationCache,
+		pendingObservation ? { pendingMetric: pendingObservation.metric } : {},
+	);
+	if (transaction.persisted) processState.pendingCalibrationObservations.delete(pendingKey);
+	else {
+		const failedMetric = transaction.record.capabilities.contextWindow;
+		if (failedMetric) {
+			processState.pendingCalibrationObservations.set(pendingKey, {
+				modelId: model.id,
+				environment,
+				metric: failedMetric,
+			});
+		}
+	}
+	calibrationCache = transaction.cache;
+	processState.calibrationCache = transaction.cache;
+	const committedRecord = getCalibrationRecord(transaction.cache, model.id, environment);
+	const metric = committedRecord?.capabilities.contextWindow;
+	const floor = metric?.floor;
+	let lowered = false;
+	if (floor != null) {
+		MODELS = MODELS.map((candidate) => {
+			if (candidate.id !== model.id) return candidate;
+			const contextWindow = Math.min(candidate.contextWindow, floor);
+			lowered ||= contextWindow < candidate.contextWindow;
+			return { ...candidate, contextWindow };
+		});
+		processState.models = MODELS;
+	}
+	debug(
+		`calibration: ${label} observed=${observed} floor=${floor ?? "?"} ` +
+			`latest=${metric?.latest ?? "?"} servedModel=${servedModel} registeredBefore=${previousRegistered ?? "?"} persisted=${transaction.persisted}`,
+	);
+	if (lowered) scheduleCalibrationRefresh(`contextWindow:${model.id}`);
 }
 
 // --- Effort level mapping ---
@@ -1066,10 +1393,9 @@ function parsePartialJson(input: string, fallback: Record<string, unknown>): Rec
 // 4. Pi executes the tool, calls streamSimple again. We swap in the new stream,
 //    resolve the MCP handler, and the generator unblocks — events flow to new stream.
 //
-// Note: resetTurnState clears turnSawStreamEvent while the generator may still
-// have queued messages from the previous turn. This is safe because step 3 nulls
-// currentPiStream, so any leftover messages hit the `!ctx().currentPiStream` guard
-// in consumeQuery and are skipped before resetTurnState runs.
+// Completed assistant snapshots may arrive after Pi has already installed the
+// tool-result continuation stream. Track their tool ids explicitly so they are
+// consumed as the prior turn instead of being mistaken for a new assistant turn.
 
 const completedStreams = new WeakSet<object>();
 
@@ -1089,6 +1415,179 @@ function ensureTurnStarted(c: QueryContext): void {
 		c.currentPiStream!.push({ type: "start", partial: c.turnOutput });
 		c.turnStarted = true;
 	}
+}
+
+function emitAllowedToolBlock(c: QueryContext, block: any, contentIndex: number, emitEmpty = false): void {
+	if (!c.currentPiStream || !c.turnOutput) return;
+	ensureTurnStarted(c);
+	if (!block.__piToolcallStartEmitted) {
+		c.currentPiStream.push({ type: "toolcall_start", contentIndex, partial: c.turnOutput });
+		block.__piToolcallStartEmitted = true;
+	}
+	if (block.__piToolcallEndEmitted) return;
+	if (!emitEmpty && isEmptyArgs(block.arguments)) {
+		if (!c.argsPendingBlocks.some((pending) => pending.block === block)) {
+			c.argsPendingBlocks.push({ block, contentIndex });
+		}
+		return;
+	}
+	c.turnSawToolCall = true;
+	c.currentPiStream.push({ type: "toolcall_end", contentIndex, toolCall: block, partial: c.turnOutput });
+	block.__piToolcallEndEmitted = true;
+}
+
+function finishPermissionDeferredTurn(c: QueryContext): void {
+	if (!c.doneDeferredForArgs || c.permissionPendingBlocks.length > 0 || c.argsPendingBlocks.length > 0 || !c.currentPiStream || !c.turnOutput) return;
+	c.doneDeferredForArgs = false;
+	const stream = c.currentPiStream;
+	const reason = c.turnSawToolCall ? "toolUse" : "stop";
+	c.turnOutput.stopReason = reason;
+	if (reason === "toolUse") expectTrailingAssistant(c);
+	stream.push({ type: "done", reason, message: c.turnOutput });
+	markStreamComplete(stream);
+	stream.end();
+	c.currentPiStream = null;
+}
+
+function resetCoordinatorForNewAssistantTurn(c: QueryContext): void {
+	if (!c.toolTurnStatePreserved) return;
+	const pendingDispatches = c.pendingMcpDispatches.map((pending) => ({
+		toolName: pending.toolName,
+		args: { ...pending.args },
+	}));
+	c.turnCoordinator.reset();
+	for (const pending of pendingDispatches) {
+		c.turnCoordinator.observeDispatch(pending.toolName, pending.args);
+	}
+	c.toolTurnStatePreserved = false;
+}
+
+function expectTrailingAssistant(c: QueryContext): void {
+	const snapshot = c.turnCoordinator.snapshot();
+	const toolCallIds = new Set([
+		...c.turnToolCallIds,
+		...snapshot.allowedIds,
+		...snapshot.deniedIds,
+		...snapshot.pendingIds,
+	]);
+	if (toolCallIds.size === 0) return;
+	c.awaitingTrailingAssistant = {
+		generation: c.sdkTurnGeneration,
+		toolCallIds,
+	};
+	debug(`provider: awaiting trailing assistant generation=${c.sdkTurnGeneration} toolIds=${toolCallIds.size}`);
+}
+
+function consumeTrailingAssistant(message: CbMessage, c: QueryContext): boolean {
+	const expected = c.awaitingTrailingAssistant;
+	if (!expected) return false;
+	const content = (message as any).message?.content;
+	c.awaitingTrailingAssistant = null;
+	if (!Array.isArray(content)) {
+		debug(`provider: trailing assistant malformed generation=${c.sdkTurnGeneration}; delivering`);
+		return false;
+	}
+	const toolCallIds = content
+		.filter((block: any) => block?.type === "tool_use" && typeof block.id === "string")
+		.map((block: any) => block.id as string);
+	const matches = expected.generation === c.sdkTurnGeneration
+		&& toolCallIds.length > 0
+		&& toolCallIds.every((id) => expected.toolCallIds.has(id));
+	if (!matches) {
+		debug(`provider: trailing assistant mismatch generation=${c.sdkTurnGeneration} expectedIds=${expected.toolCallIds.size} actualIds=${toolCallIds.length}; delivering`);
+		return false;
+	}
+	debug(`provider: consumed trailing assistant generation=${c.sdkTurnGeneration} toolIds=${toolCallIds.length}`);
+	return true;
+}
+
+function replayPermissionBufferedEvents(c: QueryContext, customToolNameToPi: Map<string, string>, model: Model<any>): void {
+	if (c.permissionReplayInProgress) return;
+	c.permissionReplayInProgress = true;
+	try {
+		while (c.permissionPendingBlocks.length === 0) {
+			if (c.permissionBufferedStreamEvents.length > 0) {
+				const message = c.permissionBufferedStreamEvents.shift() as CbMessage;
+				processStreamEvent(message, customToolNameToPi, model, c);
+				continue;
+			}
+			if (c.permissionBufferedAssistantMessages.length > 0) {
+				const message = c.permissionBufferedAssistantMessages.shift() as CbMessage;
+				processAssistantMessage(message, model, customToolNameToPi, c);
+				continue;
+			}
+			break;
+		}
+	} finally {
+		c.permissionReplayInProgress = false;
+	}
+}
+
+function resolvePermissionPendingTool(c: QueryContext, toolUseId: string, allowed: boolean, emitEmpty = false): void {
+	const pendingIndex = c.permissionPendingBlocks.findIndex((pending) => pending.block.id === toolUseId);
+	let shouldAllow = allowed;
+	if (pendingIndex >= 0) {
+		const pending = c.permissionPendingBlocks.splice(pendingIndex, 1)[0];
+		if (c.turnCoordinator.snapshot().pendingIds.includes(toolUseId)) {
+			const decision = c.turnCoordinator.recordPermissionDecision(
+				toolUseId,
+				pending.block.name,
+				allowed ? "allow" : "deny",
+				allowed ? undefined : "permission-denied",
+				pending.block.arguments,
+			);
+			shouldAllow = allowed && decision.behavior === "allow";
+		}
+		if (shouldAllow) {
+			const coordinatorArgs = c.turnCoordinator.getArgs(toolUseId);
+			if (!isEmptyArgs(coordinatorArgs)) {
+				pending.block.arguments = mapToolArgs(pending.block.name, {
+					...(pending.block.arguments ?? {}),
+					...coordinatorArgs,
+				});
+			}
+			emitAllowedToolBlock(c, pending.block, pending.contentIndex, emitEmpty);
+		}
+	}
+	if (!shouldAllow) {
+		// The pending block has already been removed from permissionPendingBlocks;
+		// locate it from the turn content by id and remove it before Pi sees the
+		// final assistant message.
+		const deniedBlockIndex = c.turnBlocks.findIndex((block: any) => block.type === "toolCall" && block.id === toolUseId);
+		if (deniedBlockIndex >= 0) c.turnBlocks.splice(deniedBlockIndex, 1);
+		c.argsPendingBlocks = c.argsPendingBlocks.filter((pending) => pending.block.id !== toolUseId);
+		const idIndex = c.turnToolCallIds.indexOf(toolUseId);
+		if (idIndex >= 0) c.turnToolCallIds.splice(idIndex, 1);
+		c.matchedToolCallIds.delete(toolUseId);
+		c.pendingResults.delete(toolUseId);
+		const pendingCall = c.pendingToolCalls.get(toolUseId);
+		if (pendingCall) {
+			c.pendingToolCalls.delete(toolUseId);
+			pendingCall.resolve({ content: [{ type: "text", text: "Tool call was denied before execution." }], isError: true });
+		}
+	}
+	c.permissionReplay?.();
+	finishPermissionDeferredTurn(c);
+}
+
+function finalizePermissionPending(c: QueryContext, message: string): void {
+	for (let attempt = 0; attempt < 1_000; attempt++) {
+		if (c.permissionPendingBlocks.length > 0) {
+			for (const pending of [...c.permissionPendingBlocks]) {
+				resolvePermissionPendingTool(c, pending.block.id, false);
+			}
+			continue;
+		}
+		if (c.permissionBufferedStreamEvents.length > 0 || c.permissionBufferedAssistantMessages.length > 0) {
+			c.permissionReplay?.();
+			if (c.permissionPendingBlocks.length > 0) continue;
+		}
+		break;
+	}
+	c.permissionBufferedStreamEvents = [];
+	c.permissionBufferedAssistantMessages = [];
+	drainPendingMcpDispatches(c, message);
+	for (const id of c.turnCoordinator.snapshot().deniedIds) resolvePermissionPendingTool(c, id, false);
 }
 
 function finalizeCurrentStream(c: QueryContext, stopReason?: string): void {
@@ -1126,13 +1625,26 @@ function processStreamEvent(
 	c: QueryContext,
 ): void {
 	if (!c.currentPiStream || !c.turnOutput) return;
-	c.turnSawStreamEvent = true;
 	const event = (message as CbMessage & { event: any }).event;
+	c.permissionReplay = () => replayPermissionBufferedEvents(c, customToolNameToPi, model);
+	if (c.turnCoordinator.requirePermission && c.permissionPendingBlocks.length > 0 && !c.permissionReplayInProgress) {
+		if (event?.type === "message_stop") c.doneDeferredForArgs = true;
+		c.permissionBufferedStreamEvents.push(message);
+		return;
+	}
+	c.turnSawStreamEvent = true;
 
 	if (event?.type === "message_start") {
+		if (c.awaitingTrailingAssistant) {
+			debug(`provider: trailing assistant missing before generation ${c.sdkTurnGeneration + 1}; clearing marker`);
+			c.awaitingTrailingAssistant = null;
+		}
+		c.sdkTurnGeneration++;
 		c.turnToolCallIds = [];
-			c.nextHandlerIdx = 0;
-			c.matchedToolCallIds = new Set();
+		c.nextHandlerIdx = 0;
+		c.matchedToolCallIds = new Set();
+		c.claimedToolUseId = null;
+		resetCoordinatorForNewAssistantTurn(c);
 		if (event.message?.usage) updateUsage(c.turnOutput, event.message.usage, model);
 		return;
 	}
@@ -1146,34 +1658,96 @@ function processStreamEvent(
 			c.turnBlocks.push({ type: "thinking", thinking: "", thinkingSignature: "", index: event.index });
 			c.currentPiStream!.push({ type: "thinking_start", contentIndex: c.turnBlocks.length - 1, partial: c.turnOutput });
 		} else if (event.content_block?.type === "tool_use") {
-			c.turnToolCallIds.push(event.content_block.id);
-			c.turnBlocks.push({
-				type: "toolCall", id: event.content_block.id,
-				name: mapToolName(event.content_block.name, customToolNameToPi),
-				arguments: (event.content_block.input as Record<string, unknown>) ?? {},
-				partialJson: "", index: event.index,
-			});
-			c.currentPiStream!.push({ type: "toolcall_start", contentIndex: c.turnBlocks.length - 1, partial: c.turnOutput });
+			// Enforce serial execution at the stream boundary, before Pi sees a
+			// second toolcall_start. canUseTool runs later in the SDK control path;
+			// relying on it alone still exposes denied parallel blocks to Pi.
+			if (c.turnToolCallIds.length > 0 && !c.turnCoordinator.requirePermission) {
+				debug(`processStreamEvent: suppressing parallel tool_use ${event.content_block.name} [${event.content_block.id}] — first tool [${c.turnToolCallIds[0]}] owns this turn`);
+				return;
+			}
+			const mappedToolName = mapToolName(event.content_block.name, customToolNameToPi);
+				const permission = c.turnCoordinator.observeStreamStart(
+					event.content_block.id,
+					mappedToolName,
+					(event.content_block.input as Record<string, unknown>) ?? {},
+					event.index,
+				);
+				const initialInput = (event.content_block.input as Record<string, unknown>) ?? {};
+				const knownArgs = c.turnCoordinator.getArgs(event.content_block.id);
+				const initialArgs = mapToolArgs(mappedToolName, { ...knownArgs, ...initialInput });
+				const dispatchArgs = bindPendingMcpDispatch(c, mappedToolName, event.content_block.id, initialArgs);
+				if (c.turnCoordinator.requirePermission && permission === "deny") {
+					resolvePermissionPendingTool(c, event.content_block.id, false);
+					return;
+				}
+				c.turnToolCallIds.push(event.content_block.id);
+				c.claimedToolUseId = event.content_block.id;
+				const block: any = {
+					type: "toolCall", id: event.content_block.id,
+					name: mappedToolName,
+					arguments: initialArgs,
+					partialJson: "", index: event.index,
+				};
+				if (!isEmptyArgs(dispatchArgs)) block.arguments = mapToolArgs(mappedToolName, dispatchArgs);
+			c.turnBlocks.push(block);
+			const contentIndex = c.turnBlocks.length - 1;
+			if (!c.turnCoordinator.requirePermission || permission === "allow") {
+				c.currentPiStream!.push({ type: "toolcall_start", contentIndex, partial: c.turnOutput });
+				block.__piToolcallStartEmitted = true;
+			} else if (permission === "pending") {
+				c.permissionPendingBlocks.push({ block, contentIndex });
+			}
 		} else {
 			debug("processStreamEvent: unhandled content_block_start type", event.content_block?.type);
 		}
 		return;
 	}
 
+	function closeOpenToolBlocksAtMessageStop(): void {
+		for (let index = 0; index < c.turnBlocks.length; index++) {
+			const block = c.turnBlocks[index];
+			if (block.type !== "toolCall" || block.index === undefined) continue;
+			delete block.index;
+			block.arguments = mapToolArgs(block.name, block.arguments);
+			delete block.partialJson;
+			const permission = c.turnCoordinator.observeStreamArgs(block.id, block.arguments, true);
+			if (c.turnCoordinator.requirePermission && permission !== "allow") {
+				if (permission === "pending" && !c.permissionPendingBlocks.some((pending) => pending.block === block)) {
+					c.permissionPendingBlocks.push({ block, contentIndex: index });
+				}
+				continue;
+			}
+			if (isEmptyArgs(block.arguments)) {
+				if (!c.argsPendingBlocks.some((pending) => pending.block === block)) {
+					debug(`processStreamEvent: message_stop found open tool block ${block.name} [${block.id}] with empty args; deferring for assistant backfill`);
+					c.argsPendingBlocks.push({ block, contentIndex: index });
+				}
+				continue;
+			}
+			if (block.__piToolcallEndEmitted) continue;
+			c.turnSawToolCall = true;
+			c.currentPiStream!.push({ type: "toolcall_end", contentIndex: index, toolCall: block, partial: c.turnOutput });
+			block.__piToolcallEndEmitted = true;
+		}
+	}
+
 	if (event?.type === "content_block_delta") {
 		const index = c.turnBlocks.findIndex((b: any) => b.index === event.index);
 		const block = c.turnBlocks[index];
 		if (!block) return;
-		if (event.delta?.type === "text_delta" && block.type === "text") {
+			if (event.delta?.type === "text_delta" && block.type === "text") {
 			block.text += event.delta.text;
 			c.currentPiStream!.push({ type: "text_delta", contentIndex: index, delta: event.delta.text, partial: c.turnOutput });
 		} else if (event.delta?.type === "thinking_delta" && block.type === "thinking") {
 			block.thinking += event.delta.thinking;
 			c.currentPiStream!.push({ type: "thinking_delta", contentIndex: index, delta: event.delta.thinking, partial: c.turnOutput });
-		} else if (event.delta?.type === "input_json_delta" && block.type === "toolCall") {
-			block.partialJson += event.delta.partial_json;
-			block.arguments = parsePartialJson(block.partialJson, block.arguments);
-			c.currentPiStream!.push({ type: "toolcall_delta", contentIndex: index, delta: event.delta.partial_json, partial: c.turnOutput });
+			} else if (event.delta?.type === "input_json_delta" && block.type === "toolCall") {
+				block.partialJson += event.delta.partial_json;
+				block.arguments = parsePartialJson(block.partialJson, block.arguments);
+				c.turnCoordinator.observeStreamArgs(block.id, block.arguments, false, event.delta.partial_json);
+				if (!c.turnCoordinator.requirePermission || c.turnCoordinator.isAllowed(block.id)) {
+					c.currentPiStream!.push({ type: "toolcall_delta", contentIndex: index, delta: event.delta.partial_json, partial: c.turnOutput });
+				}
 		} else if (event.delta?.type === "signature_delta" && block.type === "thinking") {
 			block.thinkingSignature = (block.thinkingSignature ?? "") + event.delta.signature;
 		} else {
@@ -1193,10 +1767,11 @@ function processStreamEvent(
 			c.currentPiStream!.push({ type: "thinking_end", contentIndex: index, content: block.thinking, partial: c.turnOutput });
 		} else if (block.type === "toolCall") {
 			const partialJsonLen = block.partialJson?.length ?? 0;
-			block.arguments = mapToolArgs(
-				block.name, parsePartialJson(block.partialJson, block.arguments),
-			);
-			delete block.partialJson;
+				block.arguments = mapToolArgs(
+					block.name, parsePartialJson(block.partialJson, block.arguments),
+				);
+				const permission = c.turnCoordinator.observeStreamArgs(block.id, block.arguments, true);
+				delete block.partialJson;
 
 			debug(`processStreamEvent: content_block_stop ${block.name} [${block.id}] argsSource=${
 				isEmptyArgs(block.arguments) ? "EMPTY" : "stream"
@@ -1212,12 +1787,20 @@ function processStreamEvent(
 			// (here for non-empty args, or in the backfill path for deferred
 			// blocks). This ensures message_stop's done-deferral check fires
 			// correctly even when ALL tool blocks had empty args.
-			if (isEmptyArgs(block.arguments)) {
+				if (c.turnCoordinator.requirePermission && permission !== "allow") {
+					if (permission === "pending" && !c.permissionPendingBlocks.some((pending) => pending.block === block)) {
+						c.permissionPendingBlocks.push({ block, contentIndex: index });
+					}
+					return;
+				}
+				if (block.__piToolcallEndEmitted) return;
+				if (isEmptyArgs(block.arguments)) {
 				debug(`processStreamEvent: deferring toolcall_end for ${block.name} [${block.id}] — stream args empty, will backfill from assistant message or MCP dispatch`);
 				c.argsPendingBlocks.push({ block, contentIndex: index });
-			} else {
-				c.turnSawToolCall = true;
-				c.currentPiStream!.push({ type: "toolcall_end", contentIndex: index, toolCall: block, partial: c.turnOutput });
+				} else {
+					c.turnSawToolCall = true;
+					c.currentPiStream!.push({ type: "toolcall_end", contentIndex: index, toolCall: block, partial: c.turnOutput });
+					block.__piToolcallEndEmitted = true;
 			}
 		}
 		return;
@@ -1229,6 +1812,10 @@ function processStreamEvent(
 		return;
 	}
 
+	// A dropped parallel block may never receive content_block_stop. Close the
+	// accepted block here so its start cannot remain dangling with {} args.
+	if (event?.type === "message_stop") closeOpenToolBlocksAtMessageStop();
+
 	// Check args-pending blocks FIRST, before the turnSawToolCall gate.
 	// turnSawToolCall is only set when a toolcall_end is actually emitted (non-empty
 	// args in content_block_stop, or during backfill). When ALL tool blocks had
@@ -1236,6 +1823,12 @@ function processStreamEvent(
 	// doneDeferredForArgs would never be set and the stream would hang forever.
 	// This is defense-in-depth: the backfill path also handles this, but setting
 	// doneDeferredForArgs here ensures the assistant message path knows to emit done.
+	if (event?.type === "message_stop" && c.permissionPendingBlocks.length > 0) {
+		debug(`processStreamEvent: message_stop deferring done event — ${c.permissionPendingBlocks.length} block(s) awaiting permission`);
+		c.doneDeferredForArgs = true;
+		return;
+	}
+
 	if (event?.type === "message_stop" && c.argsPendingBlocks.length > 0) {
 		debug(`processStreamEvent: message_stop deferring done event — ${c.argsPendingBlocks.length} block(s) awaiting args backfill (turnSawToolCall=${c.turnSawToolCall})`);
 		c.doneDeferredForArgs = true;
@@ -1248,6 +1841,7 @@ function processStreamEvent(
 		// consumeQuery to skip it. The MCP handler blocks the generator until
 		// pi delivers the tool result via the next streamSimple call.
 		c.turnOutput.stopReason = "toolUse";
+		expectTrailingAssistant(c);
 		const stream = c.currentPiStream;
 		stream!.push({ type: "done", reason: "toolUse", message: c.turnOutput });
 		markStreamComplete(stream);
@@ -1271,8 +1865,54 @@ function processStreamEvent(
 // the same stream lifecycle as processStreamEvent — including ending the stream on
 // tool_use to prevent deadlock with the MCP handler.
 function processAssistantMessage(message: CbMessage, model: Model<any>, customToolNameToPi: Map<string, string>, c: QueryContext): void {
+	if (consumeTrailingAssistant(message, c)) return;
+	if (!c.currentPiStream || !c.turnOutput) return;
+	c.permissionReplay = () => replayPermissionBufferedEvents(c, customToolNameToPi, model);
+	if (c.turnCoordinator.requirePermission && c.permissionPendingBlocks.length > 0 && !c.permissionReplayInProgress) {
+		c.permissionBufferedAssistantMessages.push(message);
+		return;
+	}
 	const assistantMsg = (message as any).message;
 	if (!assistantMsg?.content) return;
+
+	function emitAssistantOnlyToolUse(block: any): void {
+		if (c.turnToolCallIds.length > 0 && !c.turnCoordinator.requirePermission) {
+			debug(`processAssistantMessage: suppressing assistant-only tool_use ${block.name} [${block.id}] — first tool [${c.turnToolCallIds[0]}] owns this turn`);
+			return;
+		}
+		ensureTurnStarted(c);
+		c.turnToolCallIds.push(block.id);
+		c.claimedToolUseId = block.id;
+		const mappedName = mapToolName(block.name, customToolNameToPi);
+		let mappedArgs = mapToolArgs(mappedName, {
+			...c.turnCoordinator.getArgs(block.id),
+			...(block.input ?? {}),
+		});
+		const permission = c.turnCoordinator.observeAssistantBlock(block.id, mappedName, mappedArgs);
+		const dispatchArgs = bindPendingMcpDispatch(c, mappedName, block.id, mappedArgs);
+		if (!isEmptyArgs(dispatchArgs)) mappedArgs = mapToolArgs(mappedName, dispatchArgs);
+		if (c.turnCoordinator.requirePermission && permission === "deny") {
+			resolvePermissionPendingTool(c, block.id, false);
+			return;
+		}
+		c.turnBlocks.push({
+			type: "toolCall", id: block.id,
+			name: mappedName,
+			arguments: mappedArgs,
+		});
+		const idx = c.turnBlocks.length - 1;
+		const toolBlock = c.turnBlocks[idx];
+		if (!c.turnCoordinator.requirePermission || permission === "allow") {
+			c.turnSawToolCall = true;
+			c.currentPiStream?.push({ type: "toolcall_start", contentIndex: idx, partial: c.turnOutput });
+			toolBlock.__piToolcallStartEmitted = true;
+			c.currentPiStream?.push({ type: "toolcall_end", contentIndex: idx, toolCall: toolBlock as any, partial: c.turnOutput });
+			toolBlock.__piToolcallEndEmitted = true;
+		} else if (permission === "pending") {
+			c.permissionPendingBlocks.push({ block: toolBlock, contentIndex: idx });
+			c.doneDeferredForArgs = true;
+		}
+	}
 
 	// --- Args-backfill path (stream already delivered content, but some tool
 	// blocks had empty args). Use the assistant message's complete tool_use
@@ -1299,12 +1939,14 @@ function processAssistantMessage(message: CbMessage, model: Model<any>, customTo
 			}
 			const pending = remaining.splice(matchIdx, 1)[0];
 			const dispatchArgs = mapToolArgs(pending.block.name, tuBlock.input);
+			c.turnCoordinator.observeAssistantBlock(pending.block.id, pending.block.name, dispatchArgs);
 			if (isEmptyArgs(dispatchArgs)) {
 				debug(`processAssistantMessage: backfill for ${pending.block.name} [${pending.block.id}] — assistant args also empty, emitting with empty args (pi will validate)`);
 			} else {
 				debug(`processAssistantMessage: backfilled ${pending.block.name} [${pending.block.id}] from assistant message (argsLen=${JSON.stringify(dispatchArgs).length})`);
 			}
 			pending.block.arguments = dispatchArgs;
+			delete pending.block.index;
 			c.turnSawToolCall = true;
 			c.currentPiStream?.push({ type: "toolcall_end", contentIndex: pending.contentIndex, toolCall: pending.block, partial: c.turnOutput });
 			// Remove from the original argsPendingBlocks array
@@ -1328,6 +1970,7 @@ function processAssistantMessage(message: CbMessage, model: Model<any>, customTo
 			c.doneDeferredForArgs = false;
 			c.turnOutput.stopReason = "toolUse";
 			const stream = c.currentPiStream;
+			expectTrailingAssistant(c);
 			stream.push({ type: "done", reason: "toolUse", message: c.turnOutput });
 			markStreamComplete(stream);
 			stream.end();
@@ -1338,10 +1981,36 @@ function processAssistantMessage(message: CbMessage, model: Model<any>, customTo
 	}
 
 	// --- Original path: no stream events, this is the primary content path ---
-	if (c.turnSawStreamEvent) return;
+	if (c.turnSawStreamEvent) {
+		const unseenToolUseBlocks = assistantMsg.content.filter((block: any) =>
+			block?.type === "tool_use"
+			&& typeof block.id === "string"
+			&& !c.turnToolCallIds.includes(block.id)
+			&& !c.turnBlocks.some((turnBlock: any) => turnBlock.type === "toolCall" && turnBlock.id === block.id),
+		);
+		if (unseenToolUseBlocks.length === 0 || c.turnToolCallIds.length > 0) return;
+		debug(`processAssistantMessage: mixed stream/assistant path — ${unseenToolUseBlocks.length} unseen tool_use block(s)`);
+		for (const block of unseenToolUseBlocks) {
+			emitAssistantOnlyToolUse(block);
+			if (c.turnSawToolCall || c.permissionPendingBlocks.length > 0) break;
+		}
+		if (c.turnSawToolCall && c.currentPiStream && c.turnOutput) {
+			c.turnOutput.stopReason = "toolUse";
+			const stream = c.currentPiStream;
+			expectTrailingAssistant(c);
+			stream.push({ type: "done", reason: "toolUse", message: c.turnOutput });
+			markStreamComplete(stream);
+			stream.end();
+			c.currentPiStream = null;
+		}
+		return;
+	}
+	c.sdkTurnGeneration++;
 	c.turnToolCallIds = [];
-		c.nextHandlerIdx = 0;
-		c.matchedToolCallIds = new Set();
+	c.nextHandlerIdx = 0;
+	c.matchedToolCallIds = new Set();
+	c.claimedToolUseId = null;
+	resetCoordinatorForNewAssistantTurn(c);
 	debug(`processAssistantMessage fallback: ${assistantMsg.content.length} blocks, types=${assistantMsg.content.map((b: any) => b.type).join(",")}`);
 	for (const block of assistantMsg.content) {
 		if (block.type === "text" && block.text) {
@@ -1358,20 +2027,8 @@ function processAssistantMessage(message: CbMessage, model: Model<any>, customTo
 			c.currentPiStream?.push({ type: "thinking_start", contentIndex: idx, partial: c.turnOutput });
 			if (block.thinking) c.currentPiStream?.push({ type: "thinking_delta", contentIndex: idx, delta: block.thinking, partial: c.turnOutput });
 			c.currentPiStream?.push({ type: "thinking_end", contentIndex: idx, content: block.thinking ?? "", partial: c.turnOutput });
-		} else if (block.type === "tool_use") {
-			ensureTurnStarted(c);
-			c.turnSawToolCall = true;
-			c.turnToolCallIds.push(block.id);
-			const mappedArgs = mapToolArgs(mapToolName(block.name, customToolNameToPi), block.input);
-			c.turnBlocks.push({
-				type: "toolCall", id: block.id,
-				name: mapToolName(block.name, customToolNameToPi),
-				arguments: mappedArgs,
-			});
-			const idx = c.turnBlocks.length - 1;
-			const toolBlock = c.turnBlocks[idx];
-			c.currentPiStream?.push({ type: "toolcall_start", contentIndex: idx, partial: c.turnOutput });
-			c.currentPiStream?.push({ type: "toolcall_end", contentIndex: idx, toolCall: toolBlock as any, partial: c.turnOutput });
+			} else if (block.type === "tool_use") {
+				emitAssistantOnlyToolUse(block);
 		} else {
 			debug("processAssistantMessage: unhandled block type", block.type);
 		}
@@ -1382,6 +2039,7 @@ function processAssistantMessage(message: CbMessage, model: Model<any>, customTo
 	if (c.turnSawToolCall && c.currentPiStream && c.turnOutput) {
 		c.turnOutput.stopReason = "toolUse";
 		const stream = c.currentPiStream;
+		expectTrailingAssistant(c);
 		stream.push({ type: "done", reason: "toolUse", message: c.turnOutput });
 		markStreamComplete(stream);
 		stream.end();
@@ -1405,18 +2063,19 @@ async function consumeQuery(
 
 	for await (const message of sdkQuery) {
 		if (wasAborted()) break;
+		if ((message as { type: string }).type === "assistant") {
+			processAssistantMessage(message, model, customToolNameToPi, queryCtx);
+			continue;
+		}
 		if (!queryCtx.currentPiStream || !queryCtx.turnOutput) continue;
 
 		switch ((message as { type: string }).type) {
 			case "stream_event":
 				processStreamEvent(message, customToolNameToPi, model, queryCtx);
 				break;
-			case "assistant":
-				processAssistantMessage(message, model, customToolNameToPi, queryCtx);
-				break;
 			case "result": {
 				const resultMsg = message as Extract<CbMessage, { type: "result" }>;
-				logServedContextWindow("result", message, model);
+				await logServedContextWindow("result", message, model);
 				if (!queryCtx.turnSawStreamEvent && resultMsg.subtype === "success") {
 					ensureTurnStarted(queryCtx);
 					const text = resultMsg.result || "";
@@ -1441,9 +2100,9 @@ async function consumeQuery(
 				debug("consumeQuery: rate_limit_event", JSON.stringify(info).slice(0, 300));
 				if (info?.status === "rejected") {
 					const resetsAt = info.resetsAt ? new Date(info.resetsAt).toLocaleTimeString() : "unknown";
-					piUI?.notify(`CodeBuddy rate limited (${info.rateLimitType ?? "unknown"}) — resets at ${resetsAt}`, "warning");
+					providerUiSlot.current?.notify(`CodeBuddy rate limited (${info.rateLimitType ?? "unknown"}) — resets at ${resetsAt}`, "warning");
 				} else if (info?.status === "allowed_warning") {
-					piUI?.notify(`CodeBuddy rate limit warning: ${Math.round(info.utilization ?? 0)}% used (${info.rateLimitType ?? ""})`, "warning");
+					providerUiSlot.current?.notify(`CodeBuddy rate limit warning: ${Math.round(info.utilization ?? 0)}% used (${info.rateLimitType ?? ""})`, "warning");
 				}
 				break;
 			}
@@ -1455,6 +2114,14 @@ async function consumeQuery(
 
 	// DEBUG: trace when consumeQuery exits
 	debug(`consumeQuery: for-await loop exited, wasAborted=${wasAborted()}, capturedSessionId=${capturedSessionId?.slice(0, 8) ?? "none"}`);
+	queryCtx.awaitingTrailingAssistant = null;
+	if (wasAborted()) {
+		queryCtx.turnCoordinator.abort();
+		finalizePermissionPending(queryCtx, "Operation aborted");
+	} else {
+		queryCtx.turnCoordinator.finishTurn();
+		finalizePermissionPending(queryCtx, "Query ended");
+	}
 
 	return { capturedSessionId };
 }
@@ -1463,13 +2130,17 @@ async function consumeQuery(
  *  Two cases: tool result delivery (active query) or fresh query. */
 function streamCodebuddySdk(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
 	const stream = newAssistantMessageEventStream();
+	const invocationRoute = getProviderInvocationRoute(options);
+	if (!invocationRoute) throw new Error("CodeBuddy provider invocation is missing its Pi runtime route");
+	const providerSettings = invocationRoute.provider;
+	const cwd = invocationRoute.canonicalCwd;
 
 	// DEBUG: trace followUp message triggering
 	const lastMsgRole = context.messages[context.messages.length - 1]?.role;
 	debug(`provider: streamCodebuddySdk called, activeQuery=${!!ctx().activeQuery}, lastMsgRole=${lastMsgRole}, isReentrant=${ctx().activeQuery !== null}`);
 
 	const activeQuery = ctx().activeQuery !== null;
-	const allResults = activeQueryContexts.size > 0 ? extractAllToolResults(context) : [];
+	const allResults = providerActiveQueries().size > 0 ? extractAllToolResults(context) : [];
 	const resultCtx = allResults.length > 0 ? contextForToolResults(allResults) : undefined;
 	const isReentrantUserQuery = activeQuery && lastMsgRole === "user" && allResults.length === 0;
 	if (isReentrantUserQuery) {
@@ -1482,7 +2153,11 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 	// handlers. Results that arrive before their handler get queued in pendingResults.
 	if (resultCtx) {
 		claimCurrentPiStream(stream, "tool-result", resultCtx);
-		resultCtx.resetTurnState(model);
+		// The SDK may still be dispatching sibling MCP tools from the same
+		// assistant turn. Preserve their coordinator and pending dispatches until
+		// the next assistant message starts, otherwise a late sibling handler loses
+		// its toolCallId and waits forever.
+		resultCtx.resetTurnState(model, true);
 		debug(`provider: tool results, ${allResults.length} results, ${resultCtx.pendingToolCalls.size} waiting handlers, ctx.msgs=${context.messages.length}`);
 		for (const result of allResults) {
 			const id = result.toolCallId;
@@ -1503,7 +2178,7 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 		}
 		if (resultCtx.pendingToolCalls.size > 0) {
 			debug(`WARNING: ${resultCtx.pendingToolCalls.size} MCP handlers still waiting after delivering ${allResults.length} results`);
-			piUI?.notify(`CodeBuddy SDK: ${resultCtx.pendingToolCalls.size} tool handler(s) still waiting — provider may be stuck`, "warning");
+			providerUiSlot.current?.notify(`CodeBuddy SDK: ${resultCtx.pendingToolCalls.size} tool handler(s) still waiting — provider may be stuck`, "warning");
 		}
 
 		// Detect user messages (steer/followUp) that pi injected into context
@@ -1522,7 +2197,7 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 			}
 		}
 
-		if (sharedSession) sharedSession.cursor = context.messages.length;
+		if (providerSessionSlot.current) providerSessionSlot.current.cursor = context.messages.length;
 		resultCtx.latestCursor = Math.max(resultCtx.latestCursor, context.messages.length);
 		return stream;
 	}
@@ -1533,7 +2208,7 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 	const lastMsg = context.messages[context.messages.length - 1];
 	if (lastMsg?.role === "toolResult") {
 		debug(`provider: orphaned tool result after abort, emitting end_turn`);
-		if (sharedSession) sharedSession.cursor = context.messages.length;
+		if (providerSessionSlot.current) providerSessionSlot.current.cursor = context.messages.length;
 		const c = ctx();  // capture current context for the microtask
 		queueMicrotask(() => {
 			c.resetTurnState(model);
@@ -1550,7 +2225,7 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 	//    background subagents can run concurrently with the parent query.
 	const isReentrant = activeQuery;
 	const queryCtx = isReentrant ? new QueryContext() : ctx();
-	debug(`provider: fresh query setup, isReentrant=${isReentrant}, activeContexts=${activeQueryContexts.size}`);
+	debug(`provider: fresh query setup, isReentrant=${isReentrant}, activeContexts=${providerActiveQueries().size}`);
 
 	// 2. Fresh child context — constructor already gave us clean Maps and empty
 	//    arrays. For a reused top-level context, clear explicitly.
@@ -1561,8 +2236,10 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 	queryCtx.resetTurnState(model);
 	queryCtx.latestCursor = 0;
 
-	const { mcpTools, customToolNameToSdk, customToolNameToPi } = resolveMcpTools(context, askCodebuddyToolName);
-	const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
+	const { mcpTools, customToolNameToSdk, customToolNameToPi } = resolveMcpTools(
+		context,
+		invocationRoute.askAliases,
+	);
 	const syncResult = syncSharedSession(context.messages, cwd, customToolNameToSdk, model.id);
 	const { sessionId: resumeSessionId } = syncResult;
 	const promptBlocks = extractUserPromptBlocks(context.messages);
@@ -1575,9 +2252,9 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 			contextLength: context.messages.length,
 			lastMsgRole: lastMsg?.role,
 			isReentrant,
-			activeQueryContexts: activeQueryContexts.size,
+			activeQueryContexts: providerActiveQueries().size,
 			activeQueryExists: queryCtx.activeQuery !== null,
-			sharedSession: sharedSession ? { sessionId: sharedSession.sessionId.slice(0, 8), cursor: sharedSession.cursor } : null,
+			sharedSession: providerSessionSlot.current ? { sessionId: providerSessionSlot.current.sessionId.slice(0, 8), cursor: providerSessionSlot.current.cursor } : null,
 			messageRoles: context.messages.map((m, i) => `[${i}]${m.role}`).join(" "),
 		});
 		// Recover: use a continuation prompt so the SDK doesn't send an empty text block
@@ -1587,11 +2264,19 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 	const prompt: string | AsyncIterable<CbUserMessage> = promptBlocks
 		? wrapPromptStream(promptBlocks)
 		: promptText;
-	const mcpServers = buildMcpServers(mcpTools, queryCtx);
+	const mcpBridge = buildMcpServers(mcpTools, queryCtx);
+	const supportedMcpToolNames = new Set(mcpBridge.tools.map((tool) => tool.name));
+	for (const key of [...customToolNameToSdk.keys()]) {
+		if (!supportedMcpToolNames.has(key) && !supportedMcpToolNames.has(key.toLowerCase())) customToolNameToSdk.delete(key);
+	}
+	for (const [key, value] of [...customToolNameToPi.entries()]) {
+		if (!supportedMcpToolNames.has(value)) customToolNameToPi.delete(key);
+	}
+	const mcpServers = mcpBridge.servers;
 	const boundaryOptions = buildProviderBoundaryOptions(providerSettings);
 	const appendSystemPrompt = boundaryOptions.appendSystemPrompt;
 	const systemPrompt = appendSystemPrompt
-		? buildCodebuddySystemPrompt(context.systemPrompt, { availableToolNames: mcpTools.map((tool) => tool.name) })
+		? buildCodebuddySystemPrompt(context.systemPrompt, { availableToolNames: mcpBridge.tools.map((tool) => tool.name) })
 		: undefined;
 
 	// Provider Path keeps CodeBuddy inside Pi's tool boundary: no built-in SDK
@@ -1636,10 +2321,23 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 	// Only rejects when the tool has required params AND dispatch args are empty.
 	// Tools without required params (e.g. some MCP tools) pass through normally.
 	const piTools = context.tools ?? [];
+	queryCtx.turnCoordinator = new ToolTurnCoordinator({
+		hasRequiredArgs: (toolName) => hasRequiredParams(toolName, piTools),
+		requirePermission: true,
+	});
 	(queryOptions as SdkQueryOptions).canUseTool = async (toolName: string, input: Record<string, unknown>, opts) => {
 		const piName = mapToolName(toolName, customToolNameToPi);
 		const mappedArgs = mapToolArgs(piName, input);
-		if (isEmptyArgs(mappedArgs) && hasRequiredParams(piName, piTools)) {
+		const requiresArgs = hasRequiredParams(piName, piTools);
+		if (isEmptyArgs(mappedArgs) && requiresArgs) {
+			queryCtx.turnCoordinator.recordPermissionDecision(
+				opts.toolUseID,
+				piName,
+				"deny",
+				"empty-required-args",
+				mappedArgs,
+			);
+			resolvePermissionPendingTool(queryCtx, opts.toolUseID, false);
 			debug(`canUseTool: rejecting ${toolName}→${piName} — empty args for tool with required params (toolUseId=${opts.toolUseID})`);
 			return {
 				behavior: "deny" as const,
@@ -1647,7 +2345,15 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 				toolUseID: opts.toolUseID,
 			};
 		}
-		if (!claimSerialToolUse(queryCtx, opts.toolUseID)) {
+		const decision = queryCtx.turnCoordinator.recordPermissionDecision(
+			opts.toolUseID,
+			piName,
+			"allow",
+			undefined,
+			mappedArgs,
+		);
+		if (decision.behavior !== "allow") {
+			resolvePermissionPendingTool(queryCtx, opts.toolUseID, false);
 			debug(`canUseTool: rejecting ${toolName}→${piName} — serial mode already claimed by ${queryCtx.claimedToolUseId} (toolUseId=${opts.toolUseID})`);
 			return {
 				behavior: "deny" as const,
@@ -1655,6 +2361,8 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 				toolUseID: opts.toolUseID,
 			};
 		}
+		queryCtx.claimedToolUseId = opts.toolUseID;
+		resolvePermissionPendingTool(queryCtx, opts.toolUseID, true);
 		return { behavior: "allow" as const, toolUseID: opts.toolUseID };
 	};
 
@@ -1676,6 +2384,10 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 	const onAbort = () => {
 		wasAborted = true;
 		abortCtx.deferredUserMessages = [];
+		abortCtx.awaitingTrailingAssistant = null;
+		abortCtx.turnCoordinator.abort();
+		finalizePermissionPending(abortCtx, "Operation aborted");
+		drainPendingMcpDispatches(abortCtx, "Operation aborted");
 		for (const pending of abortCtx.pendingToolCalls.values()) { pending.resolve({ content: [{ type: "text", text: "Operation aborted" }] }); }
 		abortCtx.pendingToolCalls.clear();
 		abortCtx.pendingResults.clear();
@@ -1691,16 +2403,16 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 			sdkQuery = query({ prompt, options: queryOptions });
 			liveQueryRef.current = sdkQuery;
 			queryCtx.activeQuery = sdkQuery;
-			activeQueryContexts.add(queryCtx);
+			providerActiveQueries().add(queryCtx);
 
 		try {
 			const { capturedSessionId } = await consumeQuery(sdkQuery, customToolNameToPi, model, () => wasAborted, queryCtx);
 			debug(`provider: consumeQuery completed, stopReason=${queryCtx.turnOutput?.stopReason}, error=${queryCtx.turnOutput?.errorMessage}, aborted=${wasAborted}`);
 
 			if (wasAborted || options?.signal?.aborted) {
-				if (sharedSession) sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
+				if (providerSessionSlot.current) providerSessionSlot.current = { ...providerSessionSlot.current, needsRebuild: true, forceRotate: true };
 				queryCtx.deferredUserMessages = [];
-				debug(`provider: abort detected, marked sharedSession needsRebuild + forceRotate`);
+				debug(`provider: abort detected, marked providerSessionSlot.current needsRebuild + forceRotate`);
 				if (queryCtx.turnOutput) {
 					queryCtx.turnOutput.stopReason = "aborted";
 					queryCtx.turnOutput.errorMessage = "Operation aborted";
@@ -1713,17 +2425,17 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 				return;
 			}
 
-			const sessionId = capturedSessionId ?? sharedSession?.sessionId;
+			const sessionId = capturedSessionId ?? providerSessionSlot.current?.sessionId;
 			if (syncResult.preserveSharedSession) {
-				if (capturedSessionId && capturedSessionId !== sharedSession?.sessionId) {
+				if (capturedSessionId && capturedSessionId !== providerSessionSlot.current?.sessionId) {
 					deleteSession(capturedSessionId, cwd, process.env.CODEBUDDY_CONFIG_DIR);
 					debug(`provider: query done, deleted ephemeral session ${capturedSessionId.slice(0, 8)} to preserve shared session`);
 				}
 				debug(`provider: query done, ignoring captured session ${capturedSessionId?.slice(0, 8) ?? "none"} to preserve shared session`);
 			} else if (sessionId) {
-				const cursor = Math.max(context.messages.length, queryCtx.latestCursor, sharedSession?.cursor ?? 0);
+				const cursor = Math.max(context.messages.length, queryCtx.latestCursor, providerSessionSlot.current?.cursor ?? 0);
 				debug(`provider: query done, session=${sessionId.slice(0, 8)}, cursor=${cursor}`);
-				sharedSession = { sessionId, cursor, cwd };
+				providerSessionSlot.current = { sessionId, cursor, cwd };
 			}
 
 			while (queryCtx.deferredUserMessages.length > 0 && !isReentrant && !wasAborted) {
@@ -1731,7 +2443,7 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 				debug(`provider: replaying deferred user message (len=${steerPrompt.length})`);
 				queryCtx.resetTurnState(model);
 
-				const resumeId = sharedSession?.sessionId;
+				const resumeId = providerSessionSlot.current?.sessionId;
 				if (!resumeId) {
 					debug(`WARNING: no session to resume for deferred message, dropping`);
 					break;
@@ -1745,8 +2457,8 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 
 				try {
 					const { capturedSessionId: contSid } = await consumeQuery(contQuery, customToolNameToPi, model, () => wasAborted, queryCtx);
-					const sid = contSid ?? sharedSession?.sessionId;
-					if (sid) sharedSession = { sessionId: sid, cursor: sharedSession?.cursor ?? 0, cwd };
+					const sid = contSid ?? providerSessionSlot.current?.sessionId;
+					if (sid) providerSessionSlot.current = { sessionId: sid, cursor: providerSessionSlot.current?.cursor ?? 0, cwd };
 				} catch (contError) {
 					debug(`provider: continuation query error:`, contError);
 					break;
@@ -1764,10 +2476,10 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 			finalizeCurrentStream(queryCtx, queryCtx.turnOutput?.stopReason);
 		} catch (error) {
 			debug(`provider: query error, model=${cliModel}, aborted=${Boolean(options?.signal?.aborted)}, error=`, error);
-			if ((wasAborted || options?.signal?.aborted) && sharedSession) {
-				sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
+			if ((wasAborted || options?.signal?.aborted) && providerSessionSlot.current) {
+				providerSessionSlot.current = { ...providerSessionSlot.current, needsRebuild: true, forceRotate: true };
 			} else {
-				sharedSession = null;
+				providerSessionSlot.current = null;
 			}
 			queryCtx.deferredUserMessages = [];
 			if (queryCtx.turnOutput) {
@@ -1775,6 +2487,7 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 				queryCtx.turnOutput.errorMessage = error instanceof Error ? error.message : String(error);
 			}
 			if (!isReentrant) {
+				drainPendingMcpDispatches(queryCtx, "Query ended");
 				for (const pending of queryCtx.pendingToolCalls.values()) { pending.resolve({ content: [{ type: "text", text: "Query ended" }] }); }
 				queryCtx.pendingToolCalls.clear();
 				queryCtx.pendingResults.clear();
@@ -1789,12 +2502,13 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 			if (options?.signal) options.signal.removeEventListener("abort", onAbort);
 			liveQueryRef.current = undefined;
 			if (queryCtx.activeQuery === sdkQuery) {
+				drainPendingMcpDispatches(queryCtx, "Query ended");
 				for (const pending of queryCtx.pendingToolCalls.values()) { pending.resolve({ content: [{ type: "text", text: "Query ended" }] }); }
 				queryCtx.pendingToolCalls.clear();
 				queryCtx.pendingResults.clear();
 				queryCtx.activeQuery = null;
 			}
-			activeQueryContexts.delete(queryCtx);
+			providerActiveQueries().delete(queryCtx);
 			maybeRefreshProviderRegistration(`query-finished:${cliModel}`);
 		}
 	})();
@@ -1806,10 +2520,10 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 
 async function promptAndWait(
 	prompt: string,
-	mode: "full" | "read" | "none",
+	mode: AskMode,
 	toolCalls: Map<string, ToolCallState>,
-	signal?: AbortSignal,
-	options?: {
+	signal: AbortSignal | undefined,
+	options: {
 		systemPrompt?: string;
 		appendSkills?: boolean;
 		onStreamUpdate?: (responseText: string) => void;
@@ -1817,25 +2531,24 @@ async function promptAndWait(
 		thinking?: string;
 		isolated?: boolean;
 		context?: Context["messages"];
+		cwd: string;
+		providerSettings: NonNullable<Config["provider"]>;
 	},
 ): Promise<{ responseText: string; stopReason: string }> {
-	const cwd = process.cwd();
+	const cwd = options.cwd;
 	const requestedModel = options?.model ?? "opus";
 	const model = resolveModel(requestedModel);
 	const modelId = model?.id ?? requestedModel;
 	const cliModel = model ? codebuddyModelId(model) : modelId;
 
 	// Session resume for shared mode: create a delegation-only session from Pi's
-	// conversation context. Do not reuse or mutate the provider sharedSession;
+	// conversation context. Do not reuse or mutate the provider providerSessionSlot.current;
 	// provider sessions contain Provider Tool Guidance and Pi MCP tool history,
 	// which must not leak into AskCodebuddy's Delegation Path.
 	let resumeSessionId: string | null = null;
 	if (!options?.isolated && options?.context?.length) {
 		resumeSessionId = createDelegationSessionFromContext(options.context, cwd, modelId);
 	}
-
-	// Mode → disallowed tools
-	const disallowedTools = MODE_DISALLOWED_TOOLS[mode] ?? [];
 
 	const askSystemPrompt = options?.systemPrompt
 		? buildCodebuddySystemPrompt(options.systemPrompt, {
@@ -1848,111 +2561,53 @@ async function promptAndWait(
 	const effort = options?.thinking && options.thinking !== "off"
 		? REASONING_TO_EFFORT[options.thinking] : undefined;
 
-	const codebuddyExecutable = providerSettings.pathToCodebuddyCode;
-
-	const extraArgs: Record<string, string | null> = {
-		"strict-mcp-config": null,
-		model: cliModel,
-	};
-
 	debug("askCodebuddy:",
 		`mode=${mode} model=${modelId} cliModel=${cliModel} effort=${effort ?? "default"}`,
 		`isolated=${options?.isolated ?? false} resume=${resumeSessionId?.slice(0, 8) ?? "none"}`,
 		`sysPrompt=${Boolean(askSystemPrompt)} promptLen=${prompt.length}`);
 
-	const sdkQuery = query({
-		prompt,
-		options: {
-			cwd,
-			env: { ...process.env, DISABLE_AUTO_COMPACT: "1" },
-			permissionMode: "bypassPermissions",
-			...(disallowedTools.length ? { disallowedTools } : {}),
-			...(effort ? { effort } : {}),
-			systemPrompt: askSystemPrompt,
-			settingSources: ["user", "project"] as SettingSource[],
-			extraArgs,
-			...(resumeSessionId ? { resume: resumeSessionId } : {}),
-			...(options?.isolated ? { persistSession: false } : {}),
-			...(codebuddyExecutable ? { pathToCodebuddyCode: codebuddyExecutable } : {}),
-			...makeCliDebugOptions("askclaude"),
+	const askOptions = buildAskQueryOptions({
+		mode,
+		cwd,
+		cliModel,
+		providerSettings: options.providerSettings,
+		systemPrompt: askSystemPrompt,
+		effort,
+		resumeSessionId,
+		isolated: options.isolated,
+		debugOptions: makeCliDebugOptions("ask"),
+	});
+	const sdkQuery = query({ prompt, options: askOptions });
+	let responseText = "";
+	const result = await consumeAskQuery(sdkQuery, signal, {
+		onTextDelta(delta) {
+			responseText += delta;
+			options.onStreamUpdate?.(responseText);
+		},
+		onToolStart(tool) {
+			debug(`askCodebuddy: tool_use start: ${tool.name}`);
+			toolCalls.set(tool.id, {
+				name: mapToolName(tool.name),
+				status: "running",
+			});
+		},
+		onToolComplete(tool) {
+			toolCalls.set(tool.id, {
+				name: mapToolName(tool.name),
+				status: "complete",
+				rawInput: tool.input,
+			});
+		},
+		onResult(message) {
+			const usage = (message as any).usage;
+			if (usage) {
+				debug(`askCodebuddy: result usage: in=${usage.input_tokens} out=${usage.output_tokens} cacheRead=${usage.cache_read_input_tokens ?? 0} cacheWrite=${usage.cache_creation_input_tokens ?? 0} turns=${(message as any).num_turns ?? "?"}`);
+			}
 		},
 	});
-
-	// Abort handling
-	let wasAborted = false;
-	const onAbort = () => {
-		wasAborted = true;
-		sdkQuery.interrupt().catch(() => {});
-	};
-	if (signal?.aborted) { onAbort(); throw new Error("Aborted"); }
-	signal?.addEventListener("abort", onAbort, { once: true });
-
-	let responseText = "";
-	let sdkMessageCount = 0;
-	let textDeltaCount = 0;
-	let resultSubtype: string | undefined;
-
-	try {
-		for await (const message of sdkQuery) {
-			if (wasAborted) break;
-			sdkMessageCount++;
-
-			switch (message.type) {
-				case "stream_event": {
-					const event = (message as CbMessage & { event: any }).event;
-					// Text deltas → accumulate and stream
-					if (event?.type === "content_block_delta" && event.delta?.type === "text_delta") {
-						responseText += event.delta.text;
-						textDeltaCount++;
-						options?.onStreamUpdate?.(responseText);
-					}
-					// Tool call start → track for action summary progress
-					if (event?.type === "content_block_start" && event.content_block?.type === "tool_use") {
-						debug(`askCodebuddy: tool_use start: ${event.content_block.name}`);
-						toolCalls.set(event.content_block.id, {
-							name: mapToolName(event.content_block.name),
-							status: "running",
-						});
-					}
-					break;
-				}
-				case "assistant": {
-					// Update tool calls with full input for action summary
-					for (const block of (message as any).message?.content ?? []) {
-						if (block.type === "tool_use") {
-							toolCalls.set(block.id, {
-								name: mapToolName(block.name),
-								status: "complete",
-								rawInput: block.input,
-							});
-						}
-					}
-					break;
-				}
-				case "result": {
-					resultSubtype = message.subtype;
-					const r = message as any;
-					if (r.usage) {
-						debug(`askCodebuddy: result usage: in=${r.usage.input_tokens} out=${r.usage.output_tokens} cacheRead=${r.usage.cache_read_input_tokens ?? 0} cacheWrite=${r.usage.cache_creation_input_tokens ?? 0} turns=${r.num_turns ?? "?"}`);
-					}
-					if (!responseText && message.subtype === "success" && message.result) {
-						responseText = message.result;
-					}
-					break;
-				}
-			}
-		}
-
-		const stopReason = wasAborted ? "cancelled" : "stop";
-		debug(`askCodebuddy: done`,
-			`stopReason=${stopReason} resultSubtype=${resultSubtype ?? "none"}`,
-			`sdkMessages=${sdkMessageCount} textDeltas=${textDeltaCount} responseLen=${responseText.length}`,
-			`toolCalls=${toolCalls.size}`);
-		return { responseText, stopReason };
-	} finally {
-		signal?.removeEventListener("abort", onAbort);
-		void sdkQuery.interrupt().catch(() => {});
-	}
+	if (!responseText) responseText = result.responseText;
+	debug(`askCodebuddy: done stopReason=${result.stopReason} responseLen=${responseText.length} toolCalls=${toolCalls.size}`);
+	return { responseText, stopReason: result.stopReason };
 }
 
 // --- Extension registration ---
@@ -1963,24 +2618,28 @@ const DEFAULT_TOOL_DESCRIPTION = "Delegate to CodeBuddy for a second opinion or 
 const PREVIEW_MAX_CHARS = 1000;
 const PREVIEW_MAX_LINES = 6;
 
-let askCodebuddyToolName = "AskCodebuddy";
-let piApi: ExtensionAPI | null = null;
-let modelsDiscovered = false;
+type ModelDiscovery = (pi: ExtensionAPI) => Promise<PiModel[]>;
 
-let discoverInFlight: Promise<void> | null = null;
+function buildModelDiscoveryOptions(
+	providerSettings: NonNullable<Config["provider"]>,
+	cwd = process.cwd(),
+): SdkQueryOptions {
+	const codebuddyExecutable = providerSettings.pathToCodebuddyCode;
+	return {
+		maxTurns: 0,
+		permissionMode: "bypassPermissions",
+		tools: [],
+		settingSources: [],
+		cwd,
+		env: { ...process.env, DISABLE_AUTO_COMPACT: "1" },
+		...(codebuddyExecutable ? { pathToCodebuddyCode: codebuddyExecutable } : {}),
+		...makeCliDebugOptions("discover-models"),
+	};
+}
 
-async function discoverModels(pi: ExtensionAPI): Promise<void> {
-	await withSdkGate(async () => {
-		const codebuddyExecutable = providerSettings.pathToCodebuddyCode;
-		const commonOpts = {
-			maxTurns: 0,
-			permissionMode: "bypassPermissions" as const,
-			tools: [] as string[],
-			cwd: process.cwd(),
-			env: { ...process.env, DISABLE_AUTO_COMPACT: "1" },
-			...(codebuddyExecutable ? { pathToCodebuddyCode: codebuddyExecutable } : {}),
-			...makeCliDebugOptions("discover-models"),
-		};
+async function discoverModels(_pi: ExtensionAPI): Promise<PiModel[]> {
+	return withSdkGate(async () => {
+		const commonOpts = buildModelDiscoveryOptions(globalProviderSettings);
 
 		// Preferred path: Session API getAvailableModelsRaw() returns RawLanguageModel[]
 		// with the real per-model maxInputTokens (context window) and maxOutputTokens,
@@ -1995,10 +2654,8 @@ async function discoverModels(pi: ExtensionAPI): Promise<void> {
 				const rawModels = await session.getAvailableModelsRaw();
 				if (rawModels.length) {
 					MODELS = applyModelCalibrations(rawModelsFromSdkRaw(rawModels));
-					registerCurrentProvider(pi);
-					modelsDiscovered = true;
-					debug(`discoverModels: registered ${MODELS.length} models via getAvailableModelsRaw()`);
-					return;
+					debug(`discoverModels: discovered ${MODELS.length} models via getAvailableModelsRaw()`);
+					return MODELS;
 				}
 				debug("discoverModels: getAvailableModelsRaw() returned empty, falling back to supportedModels()");
 			} finally {
@@ -2019,54 +2676,220 @@ async function discoverModels(pi: ExtensionAPI): Promise<void> {
 			});
 			const supported = await q.supportedModels();
 			await q.return().catch(() => {});
-			if (!supported.length) return;
+			if (!supported.length) return MODELS;
 			MODELS = applyModelCalibrations(rawModelsFromSdk(supported as any));
-			registerCurrentProvider(pi);
-			modelsDiscovered = true;
-			debug(`discoverModels: registered ${MODELS.length} models from supportedModels()`);
+			debug(`discoverModels: discovered ${MODELS.length} models from supportedModels()`);
 		} catch (err) {
 			debug("discoverModels: supportedModels() failed, using fallback models", err);
 		}
+		return MODELS;
 	});
+}
+
+function beginProviderDiscovery(
+	pi: ExtensionAPI,
+	runDiscovery: ModelDiscovery,
+	source: "activation" | "survivor",
+): Promise<void> {
+	const processState = getProviderProcessState();
+	if (processState.discoveryPromise) {
+		if (source !== "activation" || !processState.discoveryIsSurvivorRestart) {
+			return processState.discoveryPromise;
+		}
+		processState.generation++;
+		processState.discoveryPromise = undefined;
+	}
+	processState.discoveryIsSurvivorRestart = source === "survivor";
+	const generation = processState.generation;
+	processState.discoveryPromise = (async () => {
+		try {
+			const discoveredModels = await runDiscovery(pi);
+			if (processState.generation !== generation) return;
+			const discoveryModels = Array.isArray(discoveredModels) ? discoveredModels : MODELS;
+			calibrationCache = processState.calibrationCache ?? calibrationCache;
+			const calibratedModels = applyModelCalibrations(discoveryModels);
+			MODELS = processState.models
+				? calibratedModels.map((model) => {
+					const previous = processState.models?.find((candidate) => candidate.id === model.id);
+					return previous
+						? { ...model, contextWindow: Math.min(previous.contextWindow, model.contextWindow) }
+						: model;
+				})
+				: calibratedModels;
+			fanOutProviderRegistration(MODELS, "discovery");
+		} catch (error) {
+			debug("provider model discovery failed", error);
+		}
+	})();
+	return processState.discoveryPromise;
 }
 
 async function ensureModelsDiscovered(): Promise<void> {
-	if (modelsDiscovered || !piApi) return;
-	discoverInFlight ??= discoverModels(piApi);
-	await discoverInFlight;
+	const processState = getProviderProcessState();
+	if (processState.models) MODELS = processState.models;
+	if (processState.discoveryPromise) {
+		await processState.discoveryPromise;
+		if (processState.models) MODELS = processState.models;
+		return;
+	}
+	const runner = processState.runners.values().next().value as ActiveProviderRunner | undefined;
+	if (runner) await beginProviderDiscovery(runner.pi, runner.runModelDiscovery, "survivor");
 }
 
-export default function (pi: ExtensionAPI) {
-	piApi = pi;
-	const config = loadConfig(process.cwd());
-	debug("loadConfig:", JSON.stringify(config));
-	providerSettings = config.provider ?? {};
-	calibrationEnvironment = buildCalibrationEnvironment(providerSettings.pathToCodebuddyCode);
-	calibrationCache = loadCalibrationCache();
-	MODELS = applyModelCalibrations(buildModels(FALLBACK_MODELS));
+export interface CodebuddySdkExtensionDependencies {
+	runtimeRegistry?: RuntimeConfigRegistry;
+	providerDispatcher?: RuntimeProviderStream;
+	runtimeStream?: RuntimeProviderStream;
+	discoverModels?: ModelDiscovery;
+	loadCalibrationCache?: () => CalibrationCache;
+	compact?: typeof compact;
+	isolatedSummaryStream?: RuntimeProviderStream;
+	createOwnerId?: () => string;
+}
+
+export function createCodebuddySdkExtension(
+	dependencies: CodebuddySdkExtensionDependencies = {},
+): (pi: ExtensionAPI) => void {
+	const runtimeRegistry = dependencies.runtimeRegistry ?? getGlobalRuntimeConfigRegistry();
+	const providerDispatcher = dependencies.providerDispatcher ?? getGlobalProviderDispatcher();
+	const runtimeStreamOverride = dependencies.runtimeStream;
+	const createOwnerId = dependencies.createOwnerId ?? (() => `${moduleInstanceId}:${nextRuntimeOwnerId++}`);
+	const runModelDiscovery = dependencies.discoverModels ?? discoverModels;
+	const loadRuntimeCalibrationCache = dependencies.loadCalibrationCache ?? loadCalibrationCache;
+	const runCompaction = dependencies.compact ?? compact;
+	const summaryStream = dependencies.isolatedSummaryStream ?? isolatedStreamFn;
+
+	return function activateCodebuddySdk(pi: ExtensionAPI): void {
+	const ownerId = createOwnerId();
+	const runtimeState = createProviderRuntimeState();
+	const runtimeStream = runtimeStreamOverride ?? ((model, context, options) => (
+		runWithProviderRuntimeState(
+			runtimeState,
+			() => streamCodebuddySdk(model, context, options),
+		)
+	));
+	const processState = getProviderProcessState();
+	processState.runners.set(ownerId, {
+		pi,
+		dispatcher: providerDispatcher,
+		runtimeState,
+		runModelDiscovery,
+	});
+	const globalConfig = loadGlobalConfig();
+	debug(`loadGlobalConfig: askCodebuddy=${!!globalConfig.config.askCodebuddy} provider=${!!globalConfig.config.provider} diagnostics=${globalConfig.diagnostics.map(({ code }) => code).join(",") || "none"}`);
+	globalProviderSettings = globalConfig.config.provider ?? {};
+	calibrationEnvironment = buildCalibrationEnvironment(globalProviderSettings.pathToCodebuddyCode);
+	const previousProcessModels = processState.models;
+	const loadedCalibrationCache = loadRuntimeCalibrationCache();
+	calibrationCache = processState.calibrationCache
+		? mergeCalibrationCaches(loadedCalibrationCache, processState.calibrationCache)
+		: loadedCalibrationCache;
+	for (const pending of processState.pendingCalibrationObservations.values()) {
+		mergeContextWindowMetric(
+			calibrationCache,
+			pending.modelId,
+			pending.environment,
+			pending.metric,
+		);
+	}
+	processState.calibrationCache = calibrationCache;
+	const fallbackModels = buildModels(FALLBACK_MODELS);
+	const baseModels = processState.models ?? fallbackModels;
+	const calibratedModels = applyModelCalibrations(baseModels);
+	MODELS = processState.models
+		? calibratedModels.map((model) => {
+			const previous = processState.models?.find((candidate) => candidate.id === model.id);
+			return previous
+				? { ...model, contextWindow: Math.min(previous.contextWindow, model.contextWindow) }
+				: model;
+		})
+		: calibratedModels;
+	processState.models = MODELS;
+	if (previousProcessModels?.some((previous) => {
+		const current = MODELS.find((model) => model.id === previous.id);
+		return current != null && current.contextWindow < previous.contextWindow;
+	})) {
+		fanOutProviderRegistration(MODELS, "activation-calibration");
+	}
+	const runtimeController = createRuntimeConfigController({
+		ownerId,
+		globalConfig,
+		registry: runtimeRegistry,
+		streamSimple: runtimeStream,
+	});
+	let askRegistrationResolved = false;
+	let registeredAskAlias: string | undefined;
+	const registerRuntimeAsk = (
+		config: Readonly<Config>,
+		canonicalCwd: string,
+		warn: (message: string) => void,
+	): string | undefined => {
+		if (askRegistrationResolved) return registeredAskAlias;
+		registeredAskAlias = registerAskCodebuddyTool(pi, config, canonicalCwd, warn);
+		askRegistrationResolved = true;
+		return registeredAskAlias;
+	};
+	let runtimeSnapshot: Readonly<RuntimeConfigSnapshot> | undefined;
 
 	const clearSession = (event: string) => {
-		debug(`${event}: clearing session ${sharedSession?.sessionId?.slice(0, 8) ?? "none"}`);
-		sharedSession = null;
-
-		// Clear the global streamSimple if this instance registered it.
-		// This allows /reload to work — the old instance clears the flag so
-		// the new instance can register fresh without wrapping stale state.
-		const g = globalThis as Record<symbol, any>;
-		if (g[ACTIVE_STREAM_SIMPLE_KEY] === streamCodebuddySdk) {
-			debug(`${event}: clearing ACTIVE_STREAM_SIMPLE_KEY`);
-			g[ACTIVE_STREAM_SIMPLE_KEY] = undefined;
-		}
+		debug(`${event}: clearing session ${providerSessionSlot.current?.sessionId?.slice(0, 8) ?? "none"}`);
+		providerSessionSlot.current = null;
 	};
-	pi.on("session_start", (event, ctx) => {
-		piUI = ctx.ui;
-		if (event.reason === "new" || event.reason === "resume" || event.reason === "fork") {
+
+	pi.on("session_start", (event, ctx) => runWithProviderRuntimeState(runtimeState, async () => {
+		providerUiSlot.current = ctx.ui;
+		if (event.reason === "new" || event.reason === "resume" || event.reason === "fork" || event.reason === "reload") {
 			clearSession(`session_start:${event.reason}`);
 		}
-	});
-	pi.on("session_shutdown", () => clearSession("session_shutdown"));
+		try {
+			const isReload = event.reason === "reload";
+			const snapshot = runtimeSnapshot
+				&& !isReload
+				? runtimeController.rebindSession(runtimeSnapshot, ctx.sessionManager.getSessionId())
+				: await runtimeController.start({
+					cwd: ctx.cwd,
+					sessionId: ctx.sessionManager.getSessionId(),
+					hasUI: ctx.hasUI,
+					forceReload: isReload,
+					select: ctx.hasUI ? ctx.ui.select.bind(ctx.ui) : undefined,
+					registerAsk: (config, canonicalCwd) => registerRuntimeAsk(
+						config,
+						canonicalCwd,
+						ctx.hasUI
+							? (message) => ctx.ui.notify(message, "warning")
+							: (message) => console.warn(message),
+					),
+				});
+			runtimeSnapshot = snapshot;
+			for (const diagnostic of snapshot.diagnostics) {
+				if (ctx.hasUI) ctx.ui.notify(diagnostic.message, "warning");
+				else console.warn(diagnostic.message);
+			}
+			debug(`runtime config: cwd=${snapshot.canonicalCwd} projectAuthorized=${snapshot.projectAuthorized} ask=${snapshot.askAlias ?? "disabled"}`);
+		} catch (error) {
+			const message = `CodeBuddy SDK could not initialize runtime config: ${errorMessage(error)}`;
+			if (ctx.hasUI) ctx.ui.notify(message, "error");
+			else console.error(message);
+		}
+	}));
+	pi.on("session_shutdown", () => runWithProviderRuntimeState(runtimeState, () => {
+		clearSession("session_shutdown");
+		runtimeController.shutdown();
+		processState.runners.delete(ownerId);
+		processState.generation++;
+		processState.discoveryPromise = undefined;
+		processState.discoveryIsSurvivorRestart = false;
+		if (processState.runners.size === 0) {
+			processState.models = undefined;
+			processState.calibrationCache = undefined;
+			processState.calibrationRefreshPending = false;
+		} else {
+			const survivor = processState.runners.values().next().value as ActiveProviderRunner;
+			void beginProviderDiscovery(survivor.pi, survivor.runModelDiscovery, "survivor");
+		}
+	}));
 
-	pi.on("session_before_compact", async (event, ctx) => {
+	pi.on("session_before_compact", (event, ctx) => runWithProviderRuntimeState(runtimeState, async () => {
 		if (ctx.model?.baseUrl !== PROVIDER_ID) return undefined;
 		debug(
 			`session_before_compact: takeover reason=${event.reason} willRetry=${event.willRetry} ` +
@@ -2074,8 +2897,16 @@ export default function (pi: ExtensionAPI) {
 			`turnPrefix=${event.preparation.turnPrefixMessages.length}`,
 		);
 		try {
+			const sessionId = ctx.sessionManager.getSessionId();
+			const invocationRoute = runtimeRegistry.resolveSession(sessionId);
+			if (!invocationRoute) {
+				throw new Error(`Pi session ${sessionId} does not belong to an active CodeBuddy runtime`);
+			}
+			const routedSummaryStream: RuntimeProviderStream = (model, context, options) => (
+				summaryStream(model, context, withProviderInvocationRoute(options, invocationRoute))
+			);
 			reinjectPriorCompactionFileOps(event.branchEntries, event.preparation);
-			const compaction = await compact(
+			const compaction = await runCompaction(
 				event.preparation,
 				ctx.model,
 				undefined,
@@ -2083,7 +2914,7 @@ export default function (pi: ExtensionAPI) {
 				event.customInstructions,
 				event.signal,
 				undefined,
-				isolatedStreamFn,
+				routedSummaryStream,
 				undefined,
 			);
 			debug(`session_before_compact: takeover complete summaryLen=${compaction.summary.length}`);
@@ -2097,7 +2928,7 @@ export default function (pi: ExtensionAPI) {
 			);
 			return { cancel: true };
 		}
-	});
+	}));
 
 	// pi /compact and session-tree navigation (rewind / fork-at-point /
 	// branch switch) both mutate pi's messages array out from under the
@@ -2107,48 +2938,45 @@ export default function (pi: ExtensionAPI) {
 	// triggers CC's autocompact-thrashing guard (issue #8). Force the next
 	// call down the REBUILD path so CC sees the current history.
 	const markRebuild = (event: string) => {
-		if (sharedSession) {
-			debug(`${event}: marking needsRebuild on session ${sharedSession.sessionId.slice(0, 8)}`);
-			sharedSession = { ...sharedSession, needsRebuild: true };
+		if (providerSessionSlot.current) {
+			debug(`${event}: marking needsRebuild on session ${providerSessionSlot.current.sessionId.slice(0, 8)}`);
+			providerSessionSlot.current = { ...providerSessionSlot.current, needsRebuild: true };
 		}
 	};
-	pi.on("session_compact", (event) => markRebuild(`session_compact:${event.reason}:willRetry=${event.willRetry}`));
-	pi.on("session_tree", () => markRebuild("session_tree"));
+	pi.on("session_compact", (event) => runWithProviderRuntimeState(runtimeState, () => markRebuild(`session_compact:${event.reason}:willRetry=${event.willRetry}`)));
+	pi.on("session_tree", () => runWithProviderRuntimeState(runtimeState, () => markRebuild("session_tree")));
 
 	// --- Provider ---
-	//
-	// Guard against re-registration when the module is loaded multiple times
-	// (e.g., when spawning subagents). The shared ModelRegistry would otherwise
-	// overwrite the parent's streamSimple, breaking tool result delivery.
-	// See ACTIVE_STREAM_SIMPLE_KEY for the full mechanism.
+	// Every ExtensionRunner owns a registration; discovery is process-wide and
+	// re-registers every active runner with the shared result.
+	registerCurrentProvider(pi, providerDispatcher, processState.models ?? MODELS);
+	void beginProviderDiscovery(pi, runModelDiscovery, "activation");
 
-	const g = globalThis as Record<symbol, any>;
-	if (!g[ACTIVE_STREAM_SIMPLE_KEY]) {
-		// First instance: store our streamSimple and register.
-		g[ACTIVE_STREAM_SIMPLE_KEY] = streamCodebuddySdk;
-		registerCurrentProvider(pi);
-		discoverInFlight = discoverModels(pi);
-	} else {
-		// Subsequent instance (subagent session): skip registration entirely.
-		// The subagent already has access to codebuddy-sdk models via the shared
-		// ModelRegistry from the parent's registration. Calls to those models
-		// route through the parent's streamSimple via reentrant QueryContexts.
-		debug(`provider: skipping re-registration, parent instance active (module=${moduleInstanceId})`);
-	}
+	function registerAskCodebuddyTool(
+		pi: ExtensionAPI,
+		config: Readonly<Config>,
+		runtimeCwd: string,
+		warn: (message: string) => void,
+	): string | undefined {
+		const askConf = config.askCodebuddy;
+		if (askConf?.enabled === false) return undefined;
+		const allowFull = askConf?.allowFullMode !== false;
+		const defaultMode = askConf?.defaultMode ?? "read";
+		const defaultIsolated = askConf?.defaultIsolated ?? false;
+		const toolName = askConf?.name ?? "AskCodebuddy";
+		if (!toolName.trim()) {
+			warn("CodeBuddy SDK: AskCodebuddy tool name cannot be empty or whitespace-only; the tool is disabled for this runtime");
+			return undefined;
+		}
+		if (pi.getAllTools().some((tool) => tool.name === toolName)) {
+			warn("CodeBuddy SDK: the configured AskCodebuddy tool name is already registered; AskCodebuddy is disabled for this runtime");
+			return undefined;
+		}
 
-	// --- AskCodebuddy tool ---
+		const modeValues = allowFull ? ["read", "full", "none"] as const : ["read", "none"] as const;
+		let modeDesc = `"read" (default): questions about the codebase — review, analysis, explain. "none": general knowledge only (no file access).`;
+		if (allowFull) modeDesc += ` "full": allows writing and bash execution (careful: runs without feedback to pi).`;
 
-	const askConf = config.askCodebuddy;
-	const allowFull = askConf?.allowFullMode !== false;
-	const defaultMode = askConf?.defaultMode ?? "read";
-	const defaultIsolated = askConf?.defaultIsolated ?? false;
-	askCodebuddyToolName = askConf?.name ?? "AskCodebuddy";
-
-	const modeValues = allowFull ? ["read", "full", "none"] as const : ["read", "none"] as const;
-	let modeDesc = `"read" (default): questions about the codebase — review, analysis, explain. "none": general knowledge only (no file access).`;
-	if (allowFull) modeDesc += ` "full": allows writing and bash execution (careful: runs without feedback to pi).`;
-
-	if (askConf?.enabled !== false) {
 		const askCodebuddyParams = Type.Object({
 			prompt: Type.String({ description: "The question or task for CodeBuddy. By default Claude sees the full conversation history. Don't research up front, let Claude explore." }),
 			mode: Type.Optional(StringEnum(modeValues, { description: modeDesc })),
@@ -2157,7 +2985,7 @@ export default function (pi: ExtensionAPI) {
 			isolated: Type.Optional(Type.Boolean({ description: "When true, Claude sees only this prompt (clean session). When false (default), Claude sees the full conversation history." })),
 		});
 		pi.registerTool<typeof askCodebuddyParams>({
-			name: askConf?.name ?? "AskCodebuddy",
+			name: toolName,
 			label: askConf?.label ?? "Ask CodeBuddy",
 			description: askConf?.description ?? (allowFull ? DEFAULT_TOOL_DESCRIPTION_FULL : DEFAULT_TOOL_DESCRIPTION),
 			parameters: askCodebuddyParams,
@@ -2206,7 +3034,7 @@ export default function (pi: ExtensionAPI) {
 
 				return new Text(text, 0, 0);
 			},
-			async execute(_id, params, signal, onUpdate, ctx) {
+				async execute(_id, params, signal, onUpdate, ctx) {
 				// Guard: circular delegation
 				if (ctx.model?.baseUrl === PROVIDER_ID) {
 					debug("askCodebuddy: blocked circular delegation (active provider is codebuddy-sdk)");
@@ -2231,14 +3059,16 @@ export default function (pi: ExtensionAPI) {
 					});
 				}, 1000);
 
-				try {
-					const result = await promptAndWait(params.prompt, mode, toolCalls, signal, {
+					try {
+						const result = await promptAndWait(params.prompt, mode, toolCalls, signal, {
 						systemPrompt: ctx.getSystemPrompt(),
 						appendSkills: askConf?.appendSkills,
 						model: params.model,
 						thinking: params.thinking,
 						isolated,
 						context: isolated ? undefined : buildSessionContext(ctx.sessionManager.getBranch()).messages as Context["messages"],
+						cwd: ctx.cwd || runtimeCwd,
+						providerSettings: config.provider ?? {},
 					});
 					clearInterval(progressInterval);
 					onUpdate?.({ content: [{ type: "text", text: "" }], details: {} });
@@ -2248,20 +3078,22 @@ export default function (pi: ExtensionAPI) {
 					const text = actions
 						? `${result.responseText}\n\n[CodeBuddy actions: ${actions}]`
 						: result.responseText;
-					return {
-						content: [{ type: "text" as const, text }],
-						details: { prompt: params.prompt, executionTime, actions },
-					};
-				} catch (err) {
-					clearInterval(progressInterval);
-					debug(`askCodebuddy error: mode=${mode}, model=${params.model ?? "default"}, isolated=${isolated}, elapsed=${((Date.now() - start) / 1000).toFixed(1)}s, error=`, err);
-					const msg = errorMessage(err);
-					return {
-						content: [{ type: "text" as const, text: `Error: ${msg}` }],
-						details: { prompt: params.prompt, executionTime: Date.now() - start, error: true },
-					};
-				}
+						return {
+							content: [{ type: "text" as const, text }],
+							details: { prompt: params.prompt, executionTime, actions },
+						};
+					} catch (err) {
+						debug(`askCodebuddy error: mode=${mode}, model=${params.model ?? "default"}, isolated=${isolated}, elapsed=${((Date.now() - start) / 1000).toFixed(1)}s, error=`, err);
+						onUpdate?.({ content: [{ type: "text", text: "" }], details: {} });
+						throw err instanceof Error ? err : new Error(errorMessage(err));
+					} finally {
+						clearInterval(progressInterval);
+					}
 			},
 		});
+		return toolName;
 	}
+	};
 }
+
+export default createCodebuddySdkExtension();

@@ -6,12 +6,17 @@
 import { describe, it, before, after, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { createRpcHarness } from "./lib/rpc-harness.mjs";
+import { BRIDGE_MODEL } from "./lib/model-config.mjs";
 
 const TEST_TIMEOUT = 60_000;
 
 const harness = createRpcHarness({
 	name: "tool-message",
-	args: ["-e", "./tests/fixtures/slow-tool-extension.ts", "--model", "codebuddy/hy3-preview-agent-ioa"],
+	args: [
+		"-e", "./tests/fixtures/slow-tool-extension.ts",
+		"-e", "./tests/fixtures/immediate-large-result-extension.ts",
+		"--model", BRIDGE_MODEL,
+	],
 	defaultTimeout: TEST_TIMEOUT,
 });
 
@@ -42,6 +47,34 @@ describe("tool-message integration", () => {
 			"Call SlowTool with seconds=1. Then repeat exactly what it returned, nothing else."
 		);
 		assert.match(text.toLowerCase(), /slowtool completed/);
+	});
+
+	it("continues to a second tool after an immediate large result", { timeout: TEST_TIMEOUT }, async () => {
+		const collector = collectText();
+		const agentEnd = waitForEvent("agent_end");
+		await send({
+			type: "prompt",
+			message: [
+				"Call ImmediateLargeResult exactly once.",
+				"After it returns, call read on src/tool-turn-coordinator.ts exactly once.",
+				"After read returns, reply exactly FAST-RESULT-CHAIN-OK and do not call more tools.",
+			].join(" "),
+		});
+		const end = await agentEnd;
+		const text = collector.stop();
+		const toolResults = (end.messages ?? []).filter((message) => message.role === "toolResult");
+
+		assert.equal(
+			toolResults.some((message) => JSON.stringify(message.content).includes("FAST-LARGE-RESULT-END")),
+			true,
+			"missing the immediate 24KB tool result",
+		);
+		assert.equal(
+			toolResults.some((message) => message.toolName === "read"),
+			true,
+			"the read tool did not complete after the immediate result",
+		);
+		assert.match(text, /FAST-RESULT-CHAIN-OK/);
 	});
 
 	it("followUp during tool execution delivers after tool completes", { timeout: TEST_TIMEOUT }, async () => {

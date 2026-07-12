@@ -57,13 +57,14 @@ export function convertPiMessages(
 				anthropicMessages.push({ role: "user", content: msg.content || "[empty]" });
 			} else if (Array.isArray(msg.content)) {
 				const parts = [];
+				let hadInvalidImage = false;
 				for (const block of msg.content) {
 					if (block.type === "text" && block.text) parts.push({ type: "text", text: block.text });
 					else if (block.type === "image" && block.data && block.mimeType) {
 						parts.push({ type: "image", source: { type: "base64", media_type: block.mimeType, data: block.data } });
-					}
+					} else if (block.type === "image") hadInvalidImage = true;
 				}
-				anthropicMessages.push({ role: "user", content: parts.length ? parts : "[image]" });
+				anthropicMessages.push({ role: "user", content: parts.length ? parts : hadInvalidImage ? [{ type: "text", text: "[invalid image omitted]" }] : "[image]" });
 			} else {
 				anthropicMessages.push({ role: "user", content: "[empty]" });
 			}

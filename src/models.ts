@@ -77,11 +77,11 @@ export function rawModelsFromSdkRaw(raw: RawLanguageModel[]): PiModel[] {
 
 export const FALLBACK_MODELS: PiModel[] = [
 	{
-		id: "hy3-preview-agent-ioa",
-		name: "Hunyuan 3 Preview",
+		id: "hy3",
+		name: "Hy3",
 		reasoning: true,
 		input: ["text"],
-		contextWindow: conservativeContextWindow("hy3-preview-agent-ioa"),
+		contextWindow: conservativeContextWindow("hy3"),
 		maxTokens: DEFAULT_MAX_TOKENS,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 	},
@@ -99,6 +99,17 @@ export function codebuddyModelId(model: { id: string }): string {
 }
 
 export function resolveModel<T extends { id: string }>(models: T[], input: string): T | undefined {
-	const lower = input.toLowerCase();
-	return models.find((m) => m.id === lower || m.id.toLowerCase().includes(lower));
+	const normalized = input.trim().toLowerCase();
+	if (!normalized) return undefined;
+	const exact = models.find((model) => model.id.toLowerCase() === normalized);
+	if (exact) return exact;
+	const prefixes = models.filter((model) => model.id.toLowerCase().startsWith(normalized));
+	if (prefixes.length === 1) return prefixes[0];
+	// Explicit user-facing aliases accepted by the AskCodebuddy schema. These
+	// are deliberately finite; arbitrary substring matching remains disabled.
+	if (["opus", "sonnet", "haiku"].includes(normalized)) {
+		const aliases = models.filter((model) => new RegExp(`(?:^|[-_/])${normalized}(?:[-_/]|$)`, "i").test(model.id));
+		if (aliases.length === 1) return aliases[0];
+	}
+	return undefined;
 }

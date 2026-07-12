@@ -24,7 +24,7 @@ rm -f "$TMPFILE" "$CODEBUDDY_SDK_DEBUG_PATH"
 
 echo "Running 5-turn conversation (text + tool use)..."
 timeout 180 pi --no-session -ne -e "$DIR" \
-  --model "codebuddy/hy3-preview-agent-ioa" \
+  --model "$BRIDGE_MODEL" \
   --mode json \
   -p "The secret number is 42. Acknowledge briefly." \
      "Write the secret number to $TMPFILE. Just the number, nothing else." \

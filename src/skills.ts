@@ -1,8 +1,6 @@
 // Skills block extraction + MCP naming constants.
 // Extracted from index.ts so tests can import without activating the extension.
 
-import { extractAgentsAppend } from "./agents-md.js";
-
 export const MCP_SERVER_NAME = "custom_tools";
 export const MCP_TOOL_PREFIX = `mcp__${MCP_SERVER_NAME}__`;
 
@@ -20,34 +18,52 @@ const BUILTIN_TOOL_GUIDANCE: Record<string, string> = {
 
 export interface ToolBridgeInstructionOptions {
 	availableToolNames?: Iterable<string>;
+	warn?: (message: string) => void;
 }
 
-function normalizeToolNames(names: Iterable<string> | undefined): Set<string> {
-	const fallback = names ?? CORE_TOOL_ORDER;
-	return new Set([...fallback].map((name) => name.toLowerCase()));
+function normalizeToolNames(names: Iterable<string> | undefined, warn?: (message: string) => void): string[] {
+	const normalized = new Map<string, string>();
+	for (const name of names ?? []) {
+		if (typeof name !== "string" || !name) continue;
+		const key = name.toLowerCase();
+		if (normalized.has(key)) {
+			warn?.(`CodeBuddy SDK: duplicate bridged tool name differs only by case; keeping ${JSON.stringify(normalized.get(key))}`);
+			continue;
+		}
+		normalized.set(key, name);
+	}
+	return [...normalized.values()];
 }
 
 function mcpName(name: string): string {
 	return `${MCP_TOOL_PREFIX}${name}`;
 }
 
-function formatToolList(toolNames: Set<string>): string {
+function codeSpan(value: string): string {
+	return `\`${value.replaceAll("`", "\\`")}\``;
+}
+
+function formatToolList(toolNames: string[]): string {
 	const ordered = [
-		...CORE_TOOL_ORDER.filter((name) => toolNames.has(name)),
-		...[...toolNames].filter((name) => !CORE_TOOL_ORDER.includes(name as typeof CORE_TOOL_ORDER[number])).sort(),
+		...CORE_TOOL_ORDER.flatMap((name) => toolNames.find((actual) => actual.toLowerCase() === name) ?? []),
+		...toolNames
+			.filter((name) => !CORE_TOOL_ORDER.includes(name.toLowerCase() as typeof CORE_TOOL_ORDER[number]))
+			.sort((left, right) => left.toLowerCase().localeCompare(right.toLowerCase())),
 	];
-	return ordered.map((name) => `\`${mcpName(name)}\``).join(", ");
+	return ordered.map((name) => codeSpan(mcpName(name))).join(", ");
 }
 
 export function buildPiToolBridgeInstruction(options: ToolBridgeInstructionOptions = {}): string {
-	const toolNames = normalizeToolNames(options.availableToolNames);
-	const has = (name: string) => toolNames.has(name);
+	const toolNames = normalizeToolNames(options.availableToolNames, options.warn);
+	const actualName = (name: string) => toolNames.find((toolName) => toolName.toLowerCase() === name);
+	const has = (name: string) => actualName(name) !== undefined;
+	const ref = (name: string) => codeSpan(mcpName(actualName(name) ?? name));
 	const lines = [
 		"Pi Tool Bridge:",
-		`Pi executes tools; CodeBuddy sees available Pi tools through the MCP server \`${MCP_SERVER_NAME}\`.`,
+		`Pi executes tools; CodeBuddy sees available Pi tools through the MCP server ${codeSpan(MCP_SERVER_NAME)}.`,
 	];
 
-	if (toolNames.size === 0) {
+	if (toolNames.length === 0) {
 		lines.push("No Pi tools are currently available through the bridge. Do not invoke unavailable tools.");
 		return lines.join("\n");
 	}
@@ -56,20 +72,20 @@ export function buildPiToolBridgeInstruction(options: ToolBridgeInstructionOptio
 	lines.push("Tool selection rules:");
 
 	if (has("read")) {
-		lines.push(`- Use \`${mcpName("read")}\` to inspect existing repository files before file-specific answers or edits. Prefer it over shelling out to cat/sed for file reads.`);
+		lines.push(`- Use ${ref("read")} to inspect existing repository files before file-specific answers or edits. Prefer it over shelling out to cat/sed for file reads.`);
 	} else {
 		lines.push("- Use available Pi file tools to inspect existing repository files before editing when such tools are present.");
 	}
 	if (has("edit")) {
-		const prefix = has("read") ? `After reading, use \`${mcpName("edit")}\`` : `Use \`${mcpName("edit")}\``;
+		const prefix = has("read") ? `After reading, use ${ref("edit")}` : `Use ${ref("edit")}`;
 		lines.push(`- ${prefix} for targeted changes to existing files. The oldText/old_string value must exactly match existing content.`);
 	}
 	if (has("write")) {
-		const editFallback = has("edit") ? ` prefer \`${mcpName("edit")}\` for targeted changes to existing files.` : " avoid broad replacement of existing files.";
-		lines.push(`- Use \`${mcpName("write")}\` only for new files or deliberate full-file replacement;${editFallback}`);
+		const editFallback = has("edit") ? ` prefer ${ref("edit")} for targeted changes to existing files.` : " avoid broad replacement of existing files.";
+		lines.push(`- Use ${ref("write")} only for new files or deliberate full-file replacement;${editFallback}`);
 	}
 	if (has("bash")) {
-		lines.push(`- Use \`${mcpName("bash")}\` only when file tools are insufficient, for search/test/build/git information, or when command execution is requested.`);
+		lines.push(`- Use ${ref("bash")} only when file tools are insufficient, for search/test/build/git information, or when command execution is requested.`);
 	}
 	// Force serial tool calls. CodeBuddy's MCP client drops arguments for
 	// 2nd+ parallel tool_call blocks in a single response: the
@@ -135,7 +151,7 @@ function applySkillsRewrite(systemPrompt: string): string {
 /** Pi system prompt as CodeBuddy override (replaces default "CodeBuddy Code" identity). */
 export function buildCodebuddySystemPrompt(
 	piSystemPrompt: string | undefined,
-	options?: { includeAgents?: boolean; includeSkills?: boolean; includeToolBridge?: boolean; availableToolNames?: Iterable<string> },
+	options?: { includeSkills?: boolean; includeToolBridge?: boolean; availableToolNames?: Iterable<string> },
 ): string | undefined {
 	const parts: string[] = [];
 	const includeToolBridge = options?.includeToolBridge !== false;
@@ -152,11 +168,6 @@ export function buildCodebuddySystemPrompt(
 			prompt = includeToolBridge ? applySkillsRewrite(prompt) : prompt;
 		}
 		if (prompt) parts.push(prompt);
-	}
-
-	if (options?.includeAgents !== false) {
-		const agents = extractAgentsAppend();
-		if (agents) parts.push(agents);
 	}
 
 	return parts.length > 0 ? parts.join("\n\n") : undefined;

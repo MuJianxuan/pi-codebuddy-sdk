@@ -17,6 +17,7 @@ setup_test_env() {
 	local log_suffix="${2:-.log}"  # optional: suffix for logfile, or "none" for no logfile
 
 	DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+	BRIDGE_MODEL="$(node "$DIR/tests/lib/model-config.mjs")"
 	LOGDIR="$DIR/.test-output"
 	mkdir -p "$LOGDIR"
 
@@ -35,7 +36,7 @@ setup_test_env() {
 	cd "$DIR"
 
 	# Export for use in tests
-	export DIR LOGDIR DEBUG_LOG LOGFILE PATH
+	export DIR BRIDGE_MODEL LOGDIR DEBUG_LOG LOGFILE PATH
 }
 
 # Kill all descendant processes (children, grandchildren, etc.).

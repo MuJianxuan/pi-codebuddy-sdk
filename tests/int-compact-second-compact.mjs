@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { createRpcHarness } from "./lib/rpc-harness.mjs";
 
 const TIMEOUT = 180_000;
-const BRIDGE_MODEL = "codebuddy/hy3-preview-agent-ioa";
+import { BRIDGE_MODEL } from "./lib/model-config.mjs";
 
 // Force each /compact to discard older turns instead of summarizing an empty
 // prefix while preserving all recent context.

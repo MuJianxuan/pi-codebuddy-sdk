@@ -103,6 +103,7 @@ Optional:
 
 | Variable | Used by |
 |----------|---------|
+| `CODEBUDDY_SDK_TEST_MODEL` | Fully-qualified CodeBuddy model for provider integration tests; defaults to `codebuddy/hy3` |
 | `FUZZ=1` | `tests/unit-queue.mjs` fuzz suite |
 
 ## Test layout
@@ -113,6 +114,7 @@ tests/
   int-*.mjs           # RPC harness against real `pi` + CodeBuddy
   int-*.sh            # Bash multi-turn / cache / smoke
   lib/
+    model-config.mjs  # Shared provider integration model + optional env override
     rpc-harness.mjs   # Spawns `pi --mode rpc`, loads `.env.test` if present
     bash-setup.sh     # Sets DEBUG paths under .test-output/
   fixtures/           # Minimal extensions and files for integration tests

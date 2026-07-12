@@ -11,7 +11,7 @@ import { join } from "node:path";
 import { createRpcHarness } from "./lib/rpc-harness.mjs";
 
 const TIMEOUT = 120_000;
-const BRIDGE_MODEL = "codebuddy/hy3-preview-agent-ioa";
+import { BRIDGE_MODEL } from "./lib/model-config.mjs";
 
 const testAgentDir = mkdtempSync(join(tmpdir(), "served-window-agent-"));
 writeFileSync(join(testAgentDir, "settings.json"), JSON.stringify({}));
