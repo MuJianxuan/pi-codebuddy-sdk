@@ -930,6 +930,40 @@ describe("serial stream emission", () => {
 		assert.equal(events.filter((event) => event.type === "toolcall_end").length, 1);
 	});
 
+	it("routes duplicate-index tool deltas to the most recently started block", () => {
+		ctx().resetTurnState(fakeModel);
+		const c = ctx();
+		const events = [];
+		c.currentPiStream = { push(event) { events.push(event); }, end() {} };
+		c.turnBlocks.push({
+			type: "toolCall", id: "read-id", name: "read",
+			arguments: { path: "README.md" },
+			partialJson: "{\"path\":\"README.md\"}",
+			index: 2,
+		});
+		c.turnBlocks.push({
+			type: "toolCall", id: "bash-id", name: "bash",
+			arguments: {}, partialJson: "", index: 2,
+		});
+
+		processStreamEvent({
+			event: {
+				type: "content_block_delta", index: 2,
+				delta: { type: "input_json_delta", partial_json: "{\"command\":\"ls\"}" },
+			},
+		}, new Map(), fakeModel, c);
+
+		assert.deepEqual(c.turnBlocks.map((block) => block.id), ["read-id", "bash-id"]);
+		assert.equal(c.turnBlocks[0].partialJson, "{\"path\":\"README.md\"}");
+		assert.deepEqual(c.turnBlocks[0].arguments, { path: "README.md" });
+		assert.equal(c.turnBlocks[1].partialJson, "{\"command\":\"ls\"}");
+		assert.deepEqual(c.turnBlocks[1].arguments, { command: "ls" });
+		assert.deepEqual(
+			events.filter((event) => event.type === "toolcall_delta").map((event) => event.contentIndex),
+			[1],
+		);
+	});
+
 	it("ignores the completed assistant from a tool turn after a fast result resumes the stream", () => {
 		const { c, events } = setupStream();
 		c.turnCoordinator = new ToolTurnCoordinator({ requirePermission: true });

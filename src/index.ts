@@ -1755,7 +1755,13 @@ function processStreamEvent(
 	}
 
 	if (event?.type === "content_block_delta") {
-		const index = c.turnBlocks.findIndex((b: any) => b.index === event.index);
+		let index = -1;
+		for (let i = c.turnBlocks.length - 1; i >= 0; i--) {
+			if (c.turnBlocks[i].index === event.index) {
+				index = i;
+				break;
+			}
+		}
 		const block = c.turnBlocks[index];
 		if (!block) return;
 			if (event.delta?.type === "text_delta" && block.type === "text") {
